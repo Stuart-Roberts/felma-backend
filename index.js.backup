@@ -1,0 +1,185 @@
+// index.js — Felma mini-app (JSON API + mini HTML)
+// Adds CORS + /api/items + /api/items/:id for Glide
+console.log("LOADED FROM:", __filename);
+console.log("ENV PORT =", process.env.PORT || "(none)");
+
+const express = require("express");
+const compression = require("compression");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+require("dotenv").config();
+
+const app = express();
+app.use(compression());
+app.use(cors()); // allow Glide (and your browser) to fetch JSON
+app.use(express.urlencoded({ extended: true })); // Twilio webhooks send form-encoded
+app.use(express.json());
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+
+// --- helpers
+const actionTier = (pr) => {
+  if (pr >= 70) return "🔥 Make it happen";
+  if (pr >= 50) return "🚀 Act on it now";
+  if (pr >= 36) return "🧭 Move it forward";
+  if (pr >= 25) return "🙂 When time allows";
+  return "⚪ Park for later";
+};
+const computePriorityRank = ({ customer_impact, team_energy, frequency, ease }) => {
+  const a = 0.57 * customer_impact + 0.43 * team_energy;
+  const b = 0.6 * frequency + 0.4 * ease;
+  return Math.round(a * b);
+};
+
+// --- health + hello
+app.get("/check", (_req, res) => res.send("ok: felma drop-in v1"));
+app.get("/", (_req, res) => res.send("Felma server is running."));
+
+// --- VOICE test
+app.post("/voice", async (req, res) => {
+  const userId = req.body?.From || "unknown";
+  await supabase.from("items").insert({ user_id: userId, transcript: null, response: "Felma answered the call (test)." });
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Hi. This is Felma. Your call reached the server. Goodbye for now.</Say><Hangup/></Response>`;
+  res.set("Content-Type", "text/xml");
+  res.send(twiml);
+});
+
+// --- SMS path
+app.post("/sms", async (req, res) => {
+  const body = (req.body?.Body || "").trim();
+  await supabase.from("items").insert({
+    user_id: req.body?.From || "unknown",
+    transcript: body,
+    response: "Felma received your text and logged it."
+  });
+  const reply = `Thanks — I’ve logged that. If you want, text 'NEXT' to capture steps, or 'OPEN' to open your items in the app.`;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${reply}</Message></Response>`;
+  res.set("Content-Type", "text/xml");
+  res.send(twiml);
+});
+
+// --- simple HTML styles
+const css = `
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 18px; max-width: 720px; margin: 0 auto; }
+  a { text-decoration: none; color: inherit; }
+  .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px 16px; margin: 10px 0; }
+  .muted { color: #6b7280; font-size: 13px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #eef2ff; }
+  .badge.red { background: #fee2e2; color: #991b1b; border: 1px solid #fecaca; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, "Courier New", monospace; }
+  .h1 { font-size: 20px; font-weight: 600; margin: 0 0 8px; }
+  form { display: grid; gap: 10px; margin-top: 10px; }
+  input[type="number"] { width: 80px; padding: 6px; }
+  input[type="text"] { width: 100%; padding: 6px; }
+  button { padding: 8px 12px; border-radius: 8px; border: 1px solid #d1d5db; background: #111827; color: #fff; }
+`;
+
+// --- list view (HTML)
+app.get("/glide/view", async (_req, res) => {
+  const { data, error } = await supabase.from("items").select("*").order("created_at", { ascending: false });
+  if (error) return res.status(500).send("Error loading items.");
+
+  const rows = (data || []).map(row => {
+    const when = new Date(row.created_at).toLocaleString();
+    const title = row.transcript || "(no text)";
+    const tier = row.priority_rank ? `<span class="badge">${actionTier(row.priority_rank)}</span>` : "";
+    const unblock = row.leader_to_unblock ? `<span class="badge red">Leader to Unblock</span>` : "";
+    return `<a class="card" href="/glide/item/${row.id}"><div class="row"><div>${title}</div><div>${tier} ${unblock}</div></div><div class="muted mono">${when}</div></a>`;
+  }).join("");
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><title>Felma — open items</title></head><body><h1 class="h1">Felma — open items</h1>${rows || '<div class="muted">No items yet.</div>'}</body></html>`);
+});
+
+// --- item detail (HTML)
+app.get("/glide/item/:id", async (req, res) => {
+  const id = req.params.id;
+  const { data: row, error } = await supabase.from("items").select("*").eq("id", id).single();
+  if (error || !row) return res.status(404).send("Item not found.");
+
+  const when = new Date(row.created_at).toLocaleString();
+  const title = row.transcript || "(no text)";
+  const tier = row.priority_rank ? `<span class="badge">${actionTier(row.priority_rank)}</span>` : "";
+  const unblock = row.leader_to_unblock ? `<span class="badge red">Leader to Unblock</span>` : "";
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><title>Felma — item</title></head>
+  <body>
+    <a href="/glide/view" class="muted">← Back</a>
+    <h1 class="h1">${title}</h1>
+    <div class="muted mono">${when}</div>
+    <div style="margin:8px 0 14px 0;">${tier} ${unblock}</div>
+    <form method="post" action="/items/${row.id}/factors">
+      <div><label>Customer Impact (1–10)</label><br/><input name="customer_impact" type="number" min="1" max="10" value="${row.customer_impact ?? ""}" required /></div>
+      <div><label>Team Energy (1–10)</label><br/><input name="team_energy" type="number" min="1" max="10" value="${row.team_energy ?? ""}" required /></div>
+      <div><label>Frequency (1–10)</label><br/><input name="frequency" type="number" min="1" max="10" value="${row.frequency ?? ""}" required /></div>
+      <div><label>Ease (1–10)</label><br/><input name="ease" type="number" min="1" max="10" value="${row.ease ?? ""}" required /></div>
+      <div><label>Your next step (optional)</label><br/><input name="user_next_step" type="text" value="${row.user_next_step ?? ""}" /></div>
+      <button type="submit">Save</button>
+    </form>
+  </body></html>`);
+});
+
+// --- save 4-factor ranking
+app.post("/items/:id/factors", async (req, res) => {
+  const id = req.params.id;
+  const CI = Number(req.body?.customer_impact);
+  const TE = Number(req.body?.team_energy);
+  const FQ = Number(req.body?.frequency);
+  const EZ = Number(req.body?.ease);
+  const next = (req.body?.user_next_step || "").toString().trim();
+
+  const inRange = (n) => Number.isFinite(n) && n >= 1 && n <= 10;
+  if (![CI, TE, FQ, EZ].every(inRange)) return res.status(400).send("All factors must be numbers 1..10.");
+
+  const pr = computePriorityRank({ customer_impact: CI, team_energy: TE, frequency: FQ, ease: EZ });
+  const tier = actionTier(pr);
+  const unblock = (TE >= 9 && EZ <= 3);
+
+  const { error } = await supabase.from("items").update({
+    customer_impact: CI, team_energy: TE, frequency: FQ, ease: EZ,
+    priority_rank: pr, action_tier: tier, leader_to_unblock: unblock,
+    user_next_step: next || null, updated_at: new Date().toISOString()
+  }).eq("id", id);
+
+  if (error) return res.status(500).send("Save failed.");
+
+  res.send(`<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><title>Saved</title></head>
+  <body><h1 class="h1">Saved.</h1><div>PR=${pr} | ${tier} | Leader to Unblock: <strong>${unblock ? "Yes" : "No"}</strong></div>
+  <p style="margin-top:12px;"><a href="/glide/item/${id}">Back to item</a> · <a href="/glide/view">All items</a></p></body></html>`);
+});
+
+// --- JSON API for Glide
+app.get("/api/items", async (_req, res) => {
+  const { data, error } = await supabase.from("items")
+    .select("id, transcript, created_at, customer_impact, team_energy, frequency, ease, priority_rank, action_tier, leader_to_unblock, user_next_step")
+    .order("created_at", { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+app.get("/api/items/:id", async (req, res) => {
+  const { data, error } = await supabase.from("items")
+    .select("id, transcript, created_at, customer_impact, team_energy, frequency, ease, priority_rank, action_tier, leader_to_unblock, user_next_step")
+    .eq("id", req.params.id).single();
+  if (error || !data) return res.status(404).json({ error: "not found" });
+  res.json(data);
+});
+
+// --- Start
+const port = process.env.PORT || 3001;
+// --- New: Simple list route for React UI
+app.get("/glide/list", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("items")
+      .select("id, transcript, created_at, priority_rank, action_tier, leader_to_unblock")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error("Error fetching items:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+app.listen(port, () => console.log(`✅ Felma server running on http://localhost:${port}`));
