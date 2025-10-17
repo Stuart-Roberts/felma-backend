@@ -21,11 +21,12 @@ const app = express();
 app.use(compression());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-aapp.use(
+app.use(
   cors({
     origin: [
-      /^http:\/\/localhost:517\d$/,        // Vite dev
-      /\.onrender\.com$/,                  // Render backend
+      /^http:\/\/localhost:517\d$/,           // Vite dev (5173/5174/5175…)
+      /^https?:\/\/.*onrender\.com$/,         // Render-hosted frontends
+      /^https?:\/\/.*ngrok.*\.dev$/,          // ngrok tunnels
     ],
     methods: ["GET", "POST", "OPTIONS"],
   })
