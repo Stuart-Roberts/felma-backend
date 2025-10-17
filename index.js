@@ -223,6 +223,42 @@ app.post("/items/:id/factors", async (req, res) => {
   res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
 });
 
+// ------------------- Create note (typed UI) -------------------
+app.post("/api/items", async (req, res) => {
+  try {
+    const text = (req.body?.text || "").trim();
+    const item_type = (req.body?.item_type || "").trim().toLowerCase();
+    const item_title = req.body?.item_title ? String(req.body.item_title).trim() : null;
+    const originator_name = req.body?.originator_name ? String(req.body.originator_name).trim() : null;
+    const source = "ui";
+
+    if (!text) return res.status(400).json({ error: "Please enter a note." });
+    if (text.length > 4000) return res.status(400).json({ error: "Note too long (max 4000 chars)." });
+    const kind = ["frustration", "idea"].includes(item_type) ? item_type : null;
+
+    const row = {
+      user_id: null,
+      item_title,
+      item_type: kind,
+      transcript: text,
+      response: "Note captured via UI.",
+      source,
+      status: "open",
+      originator_name
+    };
+
+    const { data, error } = await supabase
+      .from("items")
+      .insert(row)
+      .select("id");
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, id: data[0].id });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
 // ------------------- Start -------------------
 const port = process.env.PORT || 3001;
 app.listen(port, () => {
