@@ -137,70 +137,55 @@ app.post("/voice/handle", async (req, res) => {
 
 // ------------------- React UI APIs -------------------
 
-// List (minimal)
-app.get("/api/list", async (_req, res) => {
-  const { data, error } = await supabase
-    .from("items")
-    .select("id,item_title,transcript,created_at,priority_rank,action_tier,leader_to_unblock")
-    .order("created_at", { ascending: false });
-
-  if (error) {
-    console.error("[LIST] error:", error);
-    return res.status(500).json({ error: error.message });
-  }
-
-  const list = (data || []).map((row) => ({
-    id: row.id,
-    title: row.item_title || row.transcript || "(untitled)",
-    created_at: row.created_at,
-    priority_rank: row.priority_rank ?? null,
-    action_tier: row.action_tier ?? "—",
-    leader_to_unblock: !!row.leader_to_unblock,
-  }));
-
-  res.json(list);
-});
-
-// Detail (definitive)
-const DETAIL_COLUMNS =
-  "id,item_title,item_type,transcript,created_at,customer_impact,team_energy,frequency,ease,priority_rank,action_tier,leader_to_unblock,user_next_step,story_json,status";
-
-app.get("/api/item/:id", async (req, res) => {
+// GET /api/list  -> minimal fields for the UI list
+app.get("/api/list", async (req, res) => {
   try {
-    const id = String(req.params.id || "").trim();
-    console.log("[DETAIL] requested id =", id);
-
-    // Query with limit(1), return first element explicitly
     const { data, error } = await supabase
       .from("items")
-      .select(DETAIL_COLUMNS)
-      .eq("id", id)
-      .limit(1);
+      .select("id,item_title,transcript,created_at,priority_rank,action_tier,leader_to_unblock")
+      .order("created_at", { ascending: false });
 
-    if (error) {
-      console.error("[DETAIL] query error:", error);
-      return res.status(500).json({ error: error.message, code: error.code || "query_error", id });
-    }
+    if (error) return res.status(500).json({ error: error.message });
 
-    const row = Array.isArray(data) && data.length ? data[0] : null;
-    if (!row) {
-      console.warn("[DETAIL] no row found for id:", id);
-      return res.status(404).json({ error: "Not found", id });
-    }
+    const list = (data || []).map((row) => ({
+      id: row.id,
+      title: row.item_title || row.transcript || "(untitled)",
+      created_at: row.created_at,
+      priority_rank: row.priority_rank ?? null,
+      action_tier: row.action_tier ?? "—",
+      leader_to_unblock: !!row.leader_to_unblock,
+    }));
 
-    return res.json(row);
+    res.json(list);
   } catch (e) {
-    console.error("[DETAIL] unexpected error:", e);
-    return res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// Raw (debug) — use if needed
-app.get("/api/item/:id/raw", async (req, res) => {
+// GET /api/item/:id  -> full detail for one note
+app.get("/api/item/:id", async (req, res) => {
   const id = String(req.params.id || "").trim();
-  const { data, error } = await supabase.from("items").select("*").eq("id", id).limit(1);
-  if (error) return res.status(500).json({ error: error.message, id });
-  return res.json(Array.isArray(data) && data.length ? data[0] : null);
+
+  // quick UUID sanity check (keeps logs cleaner)
+  const uuidish = /^[0-9a-fA-F-]{32,}$/;
+  if (!uuidish.test(id)) return res.status(400).json({ error: "Bad id" });
+
+  try {
+    const { data, error } = await supabase
+      .from("items")
+      .select(
+        "id,item_title,item_type,transcript,created_at,customer_impact,team_energy,frequency,ease,priority_rank,action_tier,leader_to_unblock,user_next_step,story_json,status"
+      )
+      .eq("id", id)
+      .maybeSingle(); // tolerant if someone copied a non-existing id
+
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data) return res.status(404).json({ error: "Not found" });
+
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e), id });
+  }
 });
 
 // Save 4-factor ranking
