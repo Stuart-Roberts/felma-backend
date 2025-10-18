@@ -1,266 +1,60 @@
-// index.js — Felma backend (drop-in, definitive item route)
-// Endpoints:
-// - GET  /check
-// - GET  /
-// - POST /voice
-// - POST /sms
-// - GET  /api/list
-// - GET  /api/item/:id          (defensive, logs, works with UUID strings)
-// - GET  /api/item/:id/raw      (full-row debug view)
-// - GET  /api/ping-supabase     (connectivity/count check)
-
+// server.js — Felma backend (Render-safe, drop-in)
 const express = require("express");
-const compression = require("compression");
 const cors = require("cors");
-const { createClient } = require("@supabase/supabase-js");
-require("dotenv").config();
 
 const app = express();
 
-// Middleware
-app.use(compression());
-app.use(express.urlencoded({ extended: true }));
+// --- CORS/JSON ---
+const ORIGIN = process.env.CORS_ORIGIN || "https://felma-ui.onrender.com";
+app.use(cors({ origin: ORIGIN }));
 app.use(express.json());
-app.use(
-  cors({
-    origin: [
-      /^http:\/\/localhost:517\d$/,           // Vite dev (5173/5174/5175…)
-      /^https?:\/\/.*onrender\.com$/,         // Render-hosted frontends
-      /^https?:\/\/.*ngrok.*\.dev$/,          // ngrok tunnels
-    ],
-    methods: ["GET", "POST", "OPTIONS"],
-  })
-);
 
-// Supabase
-if (!process.env.SUPABASE_URL || !process.env.SUPABASE_KEY) {
-  console.error("❌ Missing SUPABASE_URL or SUPABASE_KEY in .env");
-  process.exit(1);
-}
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// --- In-memory store (temporary so UI can save now) ---
+const items = [];
 
-// ------------------- Helpers -------------------
-const actionTier = (pr) => {
-  if (pr >= 40) return "🚀 Move now";
-  if (pr >= 30) return "🧭 Move it forward";
-  if (pr >= 20) return "🙂 When time allows";
-  return "—";
-};
-
-const computePriorityRank = ({ customer_impact, team_energy, frequency, ease }) => {
-  const a = 0.57 * Number(customer_impact || 0) + 0.43 * Number(team_energy || 0);
-  const b = 0.6 * Number(frequency || 0) + 0.4 * Number(ease || 0);
-  return Math.round(a * b);
-};
-const leaderToUnblock = (te, ez) => Number(te) >= 9 && Number(ez) <= 3;
-const inRange1to10 = (n) => Number.isFinite(n) && n >= 1 && n <= 10;
-
-// ------------------- Health -------------------
-app.get("/", (_req, res) => res.send("Felma server is running."));
-app.get("/check", (_req, res) => res.send("ok: felma drop-in v2"));
-
-// ------------------- Twilio webhooks -------------------
-app.post("/voice", async (req, res) => {
-  // Twilio hits this when a call comes in
-  // We play a short prompt and ask for one keypress
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Hi. This is Felma. Press 1 to log this call as a new item. Press 2 to skip logging.</Say>
-  <Gather input="dtmf" numDigits="1" action="/voice/handle" method="POST" timeout="5" />
-  <Say>No input received. Goodbye.</Say>
-  <Hangup/>
-</Response>`;
-  res.set("Content-Type", "text/xml");
-  res.send(twiml);
+// --- List items (matches your UI's GET /api/list) ---
+app.get("/api/list", (req, res) => {
+  res.status(200).json(items);
 });
 
-app.post("/sms", async (req, res) => {
-  const from = req.body?.From || "unknown";
-  const body = (req.body?.Body || "").trim();
-  const lower = body.toLowerCase();
-
-  if (["stop", "stop all", "end", "unsubscribe", "cancel", "quit"].includes(lower)) {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>Got it — you can text START anytime if you want to use Felma again.</Message></Response>`;
-    res.set("Content-Type", "text/xml");
-    return res.send(xml);
-  }
-  if (lower === "help") {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>You can text Felma any time with what you’ve noticed. We’ll log it and you’ll see it in your team’s list. Reply STOP to opt out.</Message></Response>`;
-    res.set("Content-Type", "text/xml");
-    return res.send(xml);
-  }
-
-  await supabase.from("items").insert({
-    user_id: from,
-    transcript: body,
-    response: "Felma received your text and logged it.",
-  });
-
-  const reply = `Thanks — I’ve logged that. If you want, text 'NEXT' to capture steps, or 'OPEN' to open your items in the app.`;
-  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${reply}</Message></Response>`;
-  res.set("Content-Type", "text/xml");
-  res.send(xml);
-});
-
-app.post("/voice/handle", async (req, res) => {
-  const from = req.body?.From || "unknown";
-  const digits = (req.body?.Digits || "").trim();
-
-  let say;
+// --- Create item (accepts either 'frustration' or 'idea') ---
+app.post(["/api/items", "/api/item", "/api/create"], (req, res) => {
   try {
-    if (digits === "1") {
-      // Log a simple item so you can see it in your list
-      await supabase.from("items").insert({
-        user_id: from,
-        item_title: "Voice: key 1 pressed",
-        transcript: null,
-        response: "Call logged via keypress.",
-      });
-      say = "Got it. I have logged your call as an item. Thank you. Goodbye.";
-    } else if (digits === "2") {
-      say = "Okay. No item logged this time. Thank you. Goodbye.";
-    } else {
-      say = "Sorry, I did not get that. Please try again next time. Goodbye.";
+    const { content, item_type, user_id = null } = req.body || {};
+
+    if (typeof content !== "string" || !content.trim()) {
+      return res.status(400).json({ error: "content required" });
     }
-  } catch (e) {
-    say = "I hit a problem saving that. Please try again later. Goodbye.";
-  }
+    if (!["frustration", "idea"].includes(item_type)) {
+      return res
+        .status(400)
+        .json({ error: "item_type must be 'frustration' or 'idea'" });
+    }
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>${say}</Say>
-  <Hangup/>
-</Response>`;
-  res.set("Content-Type", "text/xml");
-  res.send(twiml);
-});
-
-// ------------------- React UI APIs -------------------
-
-// GET /api/list  -> minimal fields for the UI list
-app.get("/api/list", async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from("items")
-      .select("id,item_title,transcript,created_at,priority_rank,action_tier,leader_to_unblock")
-      .order("created_at", { ascending: false });
-
-    if (error) return res.status(500).json({ error: error.message });
-
-    const list = (data || []).map((row) => ({
-      id: row.id,
-      title: row.item_title || row.transcript || "(untitled)",
-      created_at: row.created_at,
-      priority_rank: row.priority_rank ?? null,
-      action_tier: row.action_tier ?? "—",
-      leader_to_unblock: !!row.leader_to_unblock,
-    }));
-
-    res.json(list);
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
-});
-
-// GET /api/item/:id  -> full detail for one note
-app.get("/api/item/:id", async (req, res) => {
-  const id = String(req.params.id || "").trim();
-
-  // quick UUID sanity check (keeps logs cleaner)
-  const uuidish = /^[0-9a-fA-F-]{32,}$/;
-  if (!uuidish.test(id)) return res.status(400).json({ error: "Bad id" });
-
-  try {
-    const { data, error } = await supabase
-      .from("items")
-      .select(
-        "id,item_title,item_type,transcript,created_at,customer_impact,team_energy,frequency,ease,priority_rank,action_tier,leader_to_unblock,user_next_step,story_json,status"
-      )
-      .eq("id", id)
-      .maybeSingle(); // tolerant if someone copied a non-existing id
-
-    if (error) return res.status(500).json({ error: error.message });
-    if (!data) return res.status(404).json({ error: "Not found" });
-
-    res.json(data);
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e), id });
-  }
-});
-
-// Save 4-factor ranking
-app.post("/items/:id/factors", async (req, res) => {
-  const id = req.params.id;
-  const CI = Number(req.body?.customer_impact);
-  const TE = Number(req.body?.team_energy);
-  const FQ = Number(req.body?.frequency);
-  const EZ = Number(req.body?.ease);
-  const next = req.body?.user_next_step ?? null;
-
-  if (![CI, TE, FQ, EZ].every(inRange1to10)) {
-    return res.status(400).json({ error: "All factors must be numbers in the range 1..10" });
-  }
-
-  const pr = computePriorityRank({ customer_impact: CI, team_energy: TE, frequency: FQ, ease: EZ });
-  const tier = actionTier(pr);
-  const unblock = leaderToUnblock(TE, EZ);
-
-  const update = {
-    customer_impact: CI,
-    team_energy: TE,
-    frequency: FQ,
-    ease: EZ,
-    priority_rank: pr,
-    action_tier: tier,
-    leader_to_unblock: unblock,
-    updated_at: new Date().toISOString(),
-  };
-  if (typeof next === "string") update.user_next_step = next;
-
-  const { error } = await supabase.from("items").update(update).eq("id", id);
-  if (error) return res.status(500).json({ error: error.message });
-
-  res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
-});
-
-// ------------------- Create note (typed UI) -------------------
-app.post("/api/items", async (req, res) => {
-  try {
-    const text = (req.body?.text || "").trim();
-    const item_type = (req.body?.item_type || "").trim().toLowerCase();
-    const item_title = req.body?.item_title ? String(req.body.item_title).trim() : null;
-    const originator_name = req.body?.originator_name ? String(req.body.originator_name).trim() : null;
-    const source = "ui";
-
-    if (!text) return res.status(400).json({ error: "Please enter a note." });
-    if (text.length > 4000) return res.status(400).json({ error: "Note too long (max 4000 chars)." });
-    const kind = ["frustration", "idea"].includes(item_type) ? item_type : null;
-
-    const row = {
-      user_id: null,
-      item_title,
-      item_type: kind,
-      transcript: text,
-      response: "Note captured via UI.",
-      source,
-      status: "open",
-      originator_name
+    const now = new Date().toISOString();
+    const item = {
+      id: items.length + 1,
+      content: content.trim(),
+      item_type,
+      user_id,
+      org_id: "DEV",
+      team_id: "GENERAL",
+      created_at: now,
     };
-
-    const { data, error } = await supabase
-      .from("items")
-      .insert(row)
-      .select("id");
-
-    if (error) return res.status(500).json({ error: error.message });
-    res.json({ ok: true, id: data[0].id });
+    items.unshift(item);
+    return res.status(201).json(item);
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    console.error("Create error:", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
-// ------------------- Start -------------------
-const port = process.env.PORT || 3001;
-app.listen(port, () => {
-  console.log(`✅ Felma server running on http://localhost:${port}`);
+// --- Root sanity check ---
+app.get("/", (_req, res) => res.status(200).send("Felma backend OK"));
+
+// --- Render-safe server start ---
+const PORT = process.env.PORT || 10000; // Render injects PORT
+const HOST = "0.0.0.0";                 // listen on all interfaces
+app.listen(PORT, HOST, () => {
+  console.log(`Felma server running on http://${HOST}:${PORT}`);
 });
