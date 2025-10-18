@@ -1,4 +1,4 @@
-// index.js — Felma backend (Render-safe + Supabase persistence)
+// index.js — Felma backend (Render-safe + Supabase persistence + sanitized CORS)
 
 const express = require("express");
 const cors = require("cors");
@@ -7,17 +7,25 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 
 /* ---------- Config ---------- */
-const ORIGIN = process.env.CORS_ORIGIN || "https://felma-ui.onrender.com";
+const RAW_ORIGIN = process.env.CORS_ORIGIN || "https://felma-ui.onrender.com";
+// If someone pasted multiple origins or added spaces, sanitize it:
+const ORIGIN = RAW_ORIGIN.split(",")[0].trim();
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY; // service role key
 
 /* ---------- Middleware ---------- */
+// Strict, single-origin CORS with Vary header (prevents invalid header errors)
 app.use(cors({ origin: ORIGIN }));
+app.use((_, res, next) => {
+  res.setHeader("Vary", "Origin");
+  next();
+});
 app.use(express.json());
 
 /* ---------- Supabase ---------- */
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.warn("⚠️ SUPABASE_URL or SUPABASE_KEY not set; DB ops will fail.");
+  console.warn("⚠️  SUPABASE_URL or SUPABASE_KEY not set; DB operations will fail.");
 }
 const supabase = createClient(SUPABASE_URL || "", SUPABASE_KEY || "");
 
@@ -43,16 +51,24 @@ app.get("/api/list", async (_req, res) => {
   }
 });
 
-// Create item (accepts 'frustration' or 'idea'); aliases for safety
+// Create item (accepts 'frustration' or 'idea'); provide route aliases for safety
 app.post(["/api/items", "/api/item", "/api/create"], async (req, res) => {
   try {
-    const { content, item_type, user_id = null, org_id = "DEV", team_id = "GENERAL" } = req.body || {};
+    const {
+      content,
+      item_type,
+      user_id = null,
+      org_id = "DEV",
+      team_id = "GENERAL",
+    } = req.body || {};
 
     if (typeof content !== "string" || !content.trim()) {
       return res.status(400).json({ error: "content required" });
     }
     if (!["frustration", "idea"].includes(item_type)) {
-      return res.status(400).json({ error: "item_type must be 'frustration' or 'idea'" });
+      return res
+        .status(400)
+        .json({ error: "item_type must be 'frustration' or 'idea'" });
     }
 
     const insertRow = {
@@ -60,8 +76,7 @@ app.post(["/api/items", "/api/item", "/api/create"], async (req, res) => {
       item_type,
       user_id,
       org_id,
-      team_id
-      // created_at defaults to NOW() in DB
+      team_id, // created_at defaults to NOW() in DB
     };
 
     const { data, error } = await supabase
