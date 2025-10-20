@@ -1,90 +1,105 @@
 // index.js — Felma backend (Render + Supabase)
+// Safe CORS + simple items routes
 
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
+// ---- Config ----
+const PORT = process.env.PORT || 10000;
+
+// Strict allowlist: add localhost + your UI
+const ALLOWED = new Set([
+  "https://felma-ui.onrender.com",
+  "http://localhost:5173",
+  "http://localhost:5174",
+]);
+
 const app = express();
 
-// --- CORS (allow your UI) ---
-const ORIGIN = process.env.CORS_ORIGIN || "https://felma-ui.onrender.com";
-app.use(cors({ origin: ORIGIN }));
-app.use(express.json({ limit: "1mb" }));
+app.use(
+  cors({
+    origin(origin, cb) {
+      // allow same-origin / curl / server-to-server
+      if (!origin) return cb(null, true);
+      cb(null, ALLOWED.has(origin));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  })
+);
 
-// --- Supabase (service key required) ---
+// IMPORTANT: do NOT manually set Access-Control-Allow-Origin anywhere.
+// (That’s what caused the ERR_INVALID_CHAR previously.)
+
+app.use(express.json());
+
+// ---- Supabase ----
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // service_role on Render
+const SUPABASE_KEY = process.env.SUPABASE_KEY; // service or anon ok for these reads/writes
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("SUPABASE_URL or SUPABASE_KEY not set; API will fail.");
+  console.error("Missing SUPABASE_URL or SUPABASE_KEY");
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false }
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// --- Health ---
-app.get("/", (_req, res) => res.send("Felma backend OK"));
+// ---- Health ----
+app.get("/", (_req, res) => res.status(200).send("Felma backend OK"));
 
-// --- List items ( newest first ) ---
+// ---- List items ----
 app.get("/api/list", async (_req, res) => {
   const { data, error } = await supabase
     .from("items")
     .select("*")
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(200);
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  return res.json(data || []);
 });
 
-// --- Get one item by id ---
+// ---- Get single item ----
 app.get("/api/items/:id", async (req, res) => {
   const { id } = req.params;
-  const { data, error } = await supabase
-    .from("items")
-    .select("*")
-    .eq("id", id)
-    .single();
+  const { data, error } = await supabase.from("items").select("*").eq("id", id).single();
 
-  if (error) return res.status(404).json({ error: "Not found" });
-  res.json(data);
+  if (error) return res.status(404).json({ error: "not_found" });
+  return res.json(data);
 });
 
-// --- Save ranking sliders for an item ---
+// ---- Save ranking (1–10 sliders) ----
+// body: { impact, energy, ease, frequency } (numbers)
+// quick rank = average of the non-null sliders (rounded)
 app.post("/api/items/:id/rank", async (req, res) => {
   const { id } = req.params;
-  let { impact, energy, frequency, ease } = req.body || {};
+  let { impact, energy, ease, frequency } = req.body || {};
 
-  // coerce to 1–10 integers
-  const clamp = (n) => Math.max(1, Math.min(10, parseInt(n || 0, 10)));
-  impact = clamp(impact);
-  energy = clamp(energy);
-  frequency = clamp(frequency);
-  ease = clamp(ease);
+  // Coerce to numbers or null
+  const nums = [impact, energy, ease, frequency].map((v) =>
+    v === undefined || v === null || v === "" ? null : Number(v)
+  );
+  [impact, energy, ease, frequency] = nums;
 
-  // simple average for now (you can change the formula later)
-  const avg = Math.round((impact + energy + frequency + ease) / 4);
+  const present = nums.filter((v) => typeof v === "number" && !Number.isNaN(v));
+  const rank =
+    present.length > 0
+      ? Math.round(present.reduce((a, b) => a + b, 0) / present.length)
+      : null;
 
   const { data, error } = await supabase
     .from("items")
-    .update({
-      impact,
-      energy,
-      frequency,
-      ease,
-      rank: avg,           // legacy name you already had
-      priority_rank: avg   // newer name some rows use
-    })
+    .update({ impact, energy, ease, frequency, rank })
     .eq("id", id)
-    .select()
+    .select("*")
     .single();
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  return res.json(data);
 });
 
-// --- Start server ---
-const PORT = process.env.PORT || 10000;
+// ---- Start server ----
 app.listen(PORT, () => {
   console.log(`Felma server running on http://0.0.0.0:${PORT}`);
 });
