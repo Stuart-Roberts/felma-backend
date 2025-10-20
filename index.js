@@ -1,99 +1,94 @@
-// index.js  — ESM + Express + robust CORS + Supabase v2
-import express from "express";
-import cors from "cors";
-import { createClient } from "@supabase/supabase-js";
+// index.js  — CommonJS backend for Render
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
 
 const PORT = process.env.PORT || 10000;
 
-// Allow either "*" or a comma-separated allowlist (no spaces is safest).
-// Example: CORS_ORIGIN="https://felma-ui.onrender.com,http://localhost:5173"
-const allowed = (process.env.CORS_ORIGIN || "*")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// CORS: single exact origin (your UI on Render)
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://felma-ui.onrender.com';
 
-const corsOptions = {
-  origin(origin, cb) {
-    // allow server-to-server or curl with no Origin
-    if (!origin) return cb(null, true);
-    if (allowed.includes("*") || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error(`CORS: origin not allowed: ${origin}`));
-  },
-  credentials: true,
-};
+// Supabase (server-side: needs Service Role KEY)
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-const app = express();
-app.use(cors(corsOptions));
-app.use(express.json());
-
-// --- Supabase helper (service role) ---
-function sb() {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_KEY; // service_role key
-  if (!url || !key) throw new Error("Supabase env missing");
-  return createClient(url, key);
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_KEY');
+  process.exit(1);
 }
 
-// --- Health ---
-app.get("/", (_req, res) => res.send("ok"));
-
-// --- Items list (optionally filter by org) ---
-app.get("/items", async (req, res) => {
-  try {
-    const org = req.query.org || null;
-    let q = sb().from("items").select("*").order("created_at", { ascending: false });
-    if (org) q = q.eq("org", org);
-    const { data, error } = await q;
-    if (error) throw error;
-    res.json({ items: data || [] });
-  } catch (e) {
-    console.error("GET /items", e);
-    res.status(500).json({ error: "fetch_failed" });
-  }
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false },
 });
 
-// --- Item detail ---
-app.get("/items/:id", async (req, res) => {
-  try {
-    const { data, error } = await sb()
-      .from("items")
-      .select("*")
-      .eq("id", req.params.id)
-      .single();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: "not_found" });
-    res.json({ item: data });
-  } catch (e) {
-    console.error("GET /items/:id", e);
-    res.status(500).json({ error: "fetch_failed" });
-  }
+const app = express();
+app.use(express.json());
+app.use(
+  cors({
+    origin: CORS_ORIGIN, // one exact origin
+  })
+);
+
+// --- Healthcheck
+app.get('/health', (_req, res) => res.type('text').send('ok'));
+
+// --- List items (optional ?org=...)
+app.get('/items', async (req, res) => {
+  const org = req.query.org || null;
+  let q = supabase.from('items').select('*');
+
+  if (org) q = q.eq('org', org);
+
+  // If your table uses a different sort column, adjust here:
+  q = q.order('created_at', { ascending: false });
+
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ items: data || [] });
 });
 
-// --- Save ranking (impact/energy/ease/frequency) ---
-app.post("/items/:id/rank", async (req, res) => {
-  try {
-    const { impact, energy, ease, frequency } = req.body || {};
-    const nums = [impact, energy, ease, frequency].map((n) => Number(n));
-    if (nums.some((n) => Number.isNaN(n))) return res.status(400).json({ error: "bad_inputs" });
-    const quick_rank = Math.round(nums.reduce((a, b) => a + b, 0) / nums.length);
+// --- Get single item
+app.get('/items/:id', async (req, res) => {
+  const { data, error } = await supabase
+    .from('items')
+    .select('*')
+    .eq('id', req.params.id)
+    .single();
 
-    const { data, error } = await sb()
-      .from("items")
-      .update({ impact, energy, ease, frequency, rank: quick_rank })
-      .eq("id", req.params.id)
-      .select("*")
-      .single();
-
-    if (error) throw error;
-    res.json({ item: data });
-  } catch (e) {
-    console.error("POST /items/:id/rank", e);
-    res.status(500).json({ error: "save_failed" });
-  }
+  if (error) return res.status(404).json({ error: 'not found' });
+  res.json({ item: data });
 });
 
-// Fallback for unknown routes
-app.use((_req, res) => res.status(404).json({ error: "route_not_found" }));
+// --- Save rank for an item (impact/energy/ease/frequency: 1..10)
+app.post('/items/:id/rank', async (req, res) => {
+  const { impact, energy, ease, frequency } = req.body || {};
+
+  // Simple average — mirrors the UI quick-rank behaviour
+  const parts = [impact, energy, ease, frequency].filter(
+    (n) => typeof n === 'number'
+  );
+  const avg = parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null;
+
+  const update = {
+    impact,
+    energy,
+    ease,
+    frequency,
+    rank: avg !== null ? Math.round(avg) : null,
+  };
+
+  const { data, error } = await supabase
+    .from('items')
+    .update(update)
+    .eq('id', req.params.id)
+    .select('*')
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ item: data });
+});
+
+app.use((_req, res) => res.status(404).json({ error: 'route not found' }));
 
 app.listen(PORT, () => {
   console.log(`Felma backend listening on ${PORT}`);
