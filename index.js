@@ -1,68 +1,113 @@
-// index.js (CommonJS, works on Render)
-// Minimal Express API with CORS + Supabase and a GET /api/list route.
+// index.js — Felma backend (Render)
 
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
 const PORT = process.env.PORT || 10000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-// ----- App & middleware -----
+// ---- CORS (keep simple; you already set CORS_ORIGIN in Render) ----
+const origins = (process.env.CORS_ORIGIN || "*")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const app = express();
-
-// Wide-open CORS for now (you already gate by Render env var).
-app.use(cors({ origin: (_origin, cb) => cb(null, true), credentials: false }));
+app.use(
+  cors({
+    origin: origins.length === 1 && origins[0] === "*" ? "*" : origins,
+  })
+);
 app.use(express.json());
 
-// ----- Health -----
+// ---- Health ----
 app.get(["/health", "/api/health"], (req, res) => {
-  res.json({
-    ok: true,
-    uptime: process.uptime(),
-    time: new Date().toISOString(),
-  });
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-// ----- Supabase -----
-let supabase = null;
-if (SUPABASE_URL && SUPABASE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+// ---- Supabase client ----
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY; // service role key recommended
+
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("Missing SUPABASE_URL or SUPABASE_KEY environment variables");
 }
 
-// Helper: try table "items", then fallback "felma_items".
-async function fetchItemsFromSupabase() {
-  if (!supabase) return [];
-  // 1) try "items"
-  let { data, error } = await supabase.from("items").select("*");
-  if (!error && Array.isArray(data)) return data;
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false },
+});
 
-  // 2) fallback "felma_items"
-  const r2 = await supabase.from("felma_items").select("*");
-  if (!r2.error && Array.isArray(r2.data)) return r2.data;
+// Table name (change here if your table isn’t called 'items')
+const TABLE = process.env.TABLE_NAME || "items";
 
-  // 3) last resort: empty list (prevents UI 404s)
-  return [];
-}
+// ---- Routes used by the UI ----
 
-// ----- List routes (UI calls /api/list) -----
-app.get(["/api/list", "/api/items", "/items"], async (req, res) => {
+// List items (the failing call you captured)
+app.get("/api/list", async (req, res) => {
   try {
-    const rows = await fetchItemsFromSupabase();
-    // UI expects an array; return [] if none.
-    res.status(200).json(rows ?? []);
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select("*")
+      .order("rank", { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ items: data || [] });
   } catch (e) {
-    // Do NOT 404 — return empty list to keep UI running.
-    res.status(200).json([]);
+    return res.status(500).json({ error: e.message });
   }
 });
 
-// Root
-app.get("/", (_req, res) => res.type("text").send("Felma backend OK"));
+// Optional: get a single item (UI may use this)
+app.get("/api/item/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
 
-// Start server
+    if (error) return res.status(error.code === "PGRST116" ? 404 : 500).json({ error: error.message });
+    return res.json({ item: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Optional: create new item (used by “+ New”)
+app.post("/api/item", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const { data, error } = await supabase.from(TABLE).insert(payload).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    return res.status(201).json({ item: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Optional: update rank (if UI sends {rank})
+app.post("/api/item/:id/rank", async (req, res) => {
+  try {
+    const { rank } = req.body || {};
+    if (typeof rank === "undefined") return res.status(400).json({ error: "rank is required" });
+
+    const { data, error } = await supabase
+      .from(TABLE)
+      .update({ rank })
+      .eq("id", req.params.id)
+      .select()
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    return res.json({ item: data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Fallback 404 (after all routes)
+app.use((req, res) => res.status(404).json({ error: "Not found" }));
+
 app.listen(PORT, () => {
   console.log(`Felma backend listening on ${PORT}`);
 });
