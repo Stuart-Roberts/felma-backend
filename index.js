@@ -1,100 +1,172 @@
-// Minimal, safe Express API for Felma
+// index.js — Felma backend (CommonJS, Render-ready)
+
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
+// ---- Env checks (fail fast with clear messages)
+const { SUPABASE_URL, SUPABASE_KEY, ADMIN_KEY } = process.env;
+if (!SUPABASE_URL) throw new Error("SUPABASE_URL is required.");
+if (!SUPABASE_KEY) throw new Error("SUPABASE_KEY (service role) is required.");
+
 const PORT = process.env.PORT || 10000;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY; // service role key
-const CORS_ORIGIN = process.env.CORS_ORIGIN || ""; // e.g. https://felma-ui.onrender.com
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.error("Missing SUPABASE_URL or SUPABASE_KEY env vars");
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false },
-});
-
+// ---- App
 const app = express();
+
+// CORS: trust the origin that made the request (works with Render + local dev)
+// NOTE: Do NOT also manually set Access-Control-* headers elsewhere.
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// CORS: allow exactly one origin (or no origin for server-to-server)
-const whitelist = new Set([CORS_ORIGIN].filter(Boolean));
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true); // curl / health / server-to-server
-      if (whitelist.has(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
-    credentials: true,
-  })
-);
-
-// -------- Health
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
-
-// -------- Shared router (mounted at "/" and "/api" for safety)
-const router = express.Router();
-
-// LIST items (used by the grid)
-router.get("/items", async (_req, res) => {
-  const { data, error } = await supabase
-    .from("items")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(200);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+// ---- Supabase client (no session persistence on server)
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// GET one item (used by the detail page)
-router.get("/items/:id", async (req, res) => {
-  const { id } = req.params;
-  const { data, error } = await supabase
-    .from("items")
-    .select("*")
-    .eq("id", id)
-    .single();
+// ---- Helpers
+function isNum1to10(n) {
+  return Number.isFinite(n) && n >= 1 && n <= 10;
+}
 
-  if (error) return res.status(404).json({ error: error.message });
-  res.json(data);
+function safeNumber(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
+}
+
+// ---- Routes
+
+// Health
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "felma-backend",
+    time: new Date().toISOString(),
+  });
 });
 
-// SAVE ranking (impact/energy/frequency/ease) for an item
-router.post("/items/:id/rank", async (req, res) => {
-  const { id } = req.params;
-  const { impact, energy, frequency, ease } = req.body || {};
-  const updates = {
-    ...(impact !== undefined && { impact }),
-    ...(energy !== undefined && { energy }),
-    ...(frequency !== undefined && { frequency }),
-    ...(ease !== undefined && { ease }),
-    updated_at: new Date().toISOString(),
-  };
+// List items (optionally by org)
+// GET /items
+// GET /items?org=G%20Project
+app.get("/items", async (req, res) => {
+  try {
+    const org = req.query.org || null;
 
-  const { data, error } = await supabase
-    .from("items")
-    .update(updates)
-    .eq("id", id)
-    .select()
-    .single();
+    let query = supabase
+      .from("items")
+      .select("*")
+      .order("created_at", { ascending: false });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+    if (org) query = query.eq("org", org);
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Supabase list error:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, items: data || [] });
+  } catch (e) {
+    console.error("List items exception:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
 });
 
-// Mount at both "" and "/api" to cover UI variants
-app.use("/", router);
-app.use("/api", router);
+// Get single item
+// GET /items/:id
+app.get("/items/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
 
-// 404 handler (json)
-app.use((_req, res) => res.status(404).json({ error: "Not found" }));
+    const { data, error } = await supabase
+      .from("items")
+      .select("*")
+      .eq("id", id)
+      .single();
 
-app.listen(PORT, () => {
+    if (error && error.code === "PGRST116") {
+      // row not found
+      return res.status(404).json({ ok: false, error: "Not found" });
+    }
+    if (error) {
+      console.error("Supabase get error:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    console.error("Get item exception:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// Save ranking for an item
+// POST /items/:id/rank
+// Body: { impact, energy, ease, frequency }
+// (All optional but if provided must be 1..10)
+app.post("/items/:id/rank", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const body = req.body || {};
+
+    const impact = safeNumber(body.impact);
+    const energy = safeNumber(body.energy);
+    const ease = safeNumber(body.ease);
+    const frequency = safeNumber(body.frequency);
+
+    const update = {};
+    if (impact !== null) {
+      if (!isNum1to10(impact)) return res.status(400).json({ ok: false, error: "impact must be 1..10" });
+      update.impact = impact;
+    }
+    if (energy !== null) {
+      if (!isNum1to10(energy)) return res.status(400).json({ ok: false, error: "energy must be 1..10" });
+      update.energy = energy;
+    }
+    if (ease !== null) {
+      if (!isNum1to10(ease)) return res.status(400).json({ ok: false, error: "ease must be 1..10" });
+      update.ease = ease;
+    }
+    if (frequency !== null) {
+      if (!isNum1to10(frequency)) return res.status(400).json({ ok: false, error: "frequency must be 1..10" });
+      update.frequency = frequency;
+    }
+
+    // If any of the four were provided, compute quick_rank = average of provided ones
+    const provided = [impact, energy, ease, frequency].filter((v) => v !== null);
+    if (provided.length > 0) {
+      const avg = provided.reduce((a, b) => a + b, 0) / provided.length;
+      update.quick_rank = Math.round(avg); // integer badge shown in UI
+    }
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ ok: false, error: "No ranking fields provided" });
+    }
+
+    const { data, error } = await supabase
+      .from("items")
+      .update(update)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error && error.code === "PGRST116") {
+      return res.status(404).json({ ok: false, error: "Not found" });
+    }
+    if (error) {
+      console.error("Supabase rank update error:", error);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
+
+    return res.json({ ok: true, item: data });
+  } catch (e) {
+    console.error("Rank exception:", e);
+    return res.status(500).json({ ok: false, error: "Server error" });
+  }
+});
+
+// ---- Start
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Felma backend listening on ${PORT}`);
 });
