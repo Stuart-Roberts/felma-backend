@@ -1,28 +1,26 @@
-// index.js — Felma server (pilot, CJS)
-// Env needed: SUPABASE_URL, SUPABASE_KEY (service role or anon with R/W to public.items)
+// index.js — Felma backend (MVP)
+// Node 18+ on Render. Uses CommonJS (require).
 
 const express = require("express");
 const compression = require("compression");
 const { createClient } = require("@supabase/supabase-js");
 
-const PORT = process.env.PORT || 10000;
+// --- env ---
+const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const TABLE = "items";
-
 if (!SUPABASE_URL || !SUPABASE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_KEY");
-  process.exit(1);
 }
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
-
+// --- app/bootstrap ---
 const app = express();
 app.use(compression());
-app.use(express.urlencoded({ extended: true })); // Twilio form-encoded
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Simple CORS for MVP
+// permissive CORS for MVP
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -31,21 +29,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- Helpers (agreed logic) ----------
-function clamp1to10(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return null;
-  return Math.min(10, Math.max(1, Math.round(x)));
+// ---------- helpers (rank, tier, leader-to-unblock) ----------
+function numOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = typeof v === "string" ? Number(v) : v;
+  return Number.isFinite(n) ? n : null;
 }
-
-// PR = round( (0.57*Customer + 0.43*Team) * (0.6*Frequency + 0.4*Ease) )
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
+  // PR = round( (0.57*Customer + 0.43*Team) * (0.6*Frequency + 0.4*Ease) )
   const a = 0.57 * customer_impact + 0.43 * team_energy;
   const b = 0.6 * frequency + 0.4 * ease;
   return Math.round(a * b);
 }
-
-// FIVE tiers (exact thresholds)
 function tierForPR(pr) {
   if (pr >= 70) return "🔥 Make it happen";
   if (pr >= 50) return "🚀 Act on it now";
@@ -53,204 +48,146 @@ function tierForPR(pr) {
   if (pr >= 25) return "🙂 When time allows";
   return "⚪ Park for later";
 }
-
-// Leader to Unblock = Team Energy ≥ 9 AND Ease ≤ 3
 function shouldLeaderUnblock(team_energy, ease) {
-  return Number(team_energy) >= 9 && Number(ease) <= 3;
+  // Pilot rule: Team Energy ≥ 9 AND Ease ≤ 3
+  return team_energy >= 9 && ease <= 3;
 }
 
-// Decorate rows that might be missing derived values (old seed data)
-function decorateRow(r) {
-  const out = { ...r };
-  const ok =
-    [r.customer_impact, r.team_energy, r.frequency, r.ease].every(
-      (v) => typeof v === "number" && v >= 1 && v <= 10
+// ---------- health ----------
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, table: "items", url: SUPABASE_URL });
+});
+
+// ---------- list (used by UI grid) ----------
+app.get("/api/list", async (_req, res) => {
+  const { data, error } = await supabase
+    .from("items")
+    .select(
+      "id, content, transcript, created_at, priority_rank, action_tier, leader_to_unblock, user_id, owner, org_id"
+    )
+    .order("priority_rank", { ascending: false })
+    .limit(500);
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Normalize fields UI expects
+  const rows = (data || []).map((r) => ({
+    id: r.id,
+    title: r.content || r.transcript || "(untitled)",
+    created_at: r.created_at,
+    priority_rank: r.priority_rank || 0,
+    action_tier: r.action_tier || "⚪ Park for later",
+    leader_to_unblock: !!r.leader_to_unblock,
+    originator: r.owner || r.user_id || null,
+    org_name: "St Michael's",
+  }));
+
+  res.json({ items: rows });
+});
+
+// ---------- add NEW item (called by UI: POST /items/new) ----------
+app.post("/items/new", async (req, res) => {
+  // Accept several possible field names from UI
+  const story =
+    req.body.story ?? req.body.title ?? req.body.content ?? req.body.transcript ?? "(untitled)";
+
+  const originator =
+    req.body.originator ?? req.body.owner ?? req.body.user_id ?? req.body.me ?? null;
+
+  const customer_impact = numOrNull(req.body.customer_impact);
+  const team_energy = numOrNull(req.body.team_energy);
+  const frequency = numOrNull(req.body.frequency);
+  const ease = numOrNull(req.body.ease);
+
+  let priority_rank = null;
+  let action_tier = null;
+  let leader_to_unblock = null;
+
+  // If all 4 factors provided (1..10), compute rank/tier/unblock.
+  const allHave =
+    [customer_impact, team_energy, frequency, ease].every(
+      (n) => Number.isFinite(n) && n >= 1 && n <= 10
     );
 
-  if (!Number.isFinite(out.priority_rank)) {
-    out.priority_rank = ok ? computePriorityRank(r.customer_impact, r.team_energy, r.frequency, r.ease) : 0;
+  if (allHave) {
+    priority_rank = computePriorityRank(customer_impact, team_energy, frequency, ease);
+    action_tier = tierForPR(priority_rank);
+    leader_to_unblock = shouldLeaderUnblock(team_energy, ease);
   }
-  if (!out.action_tier) out.action_tier = tierForPR(out.priority_rank);
-  if (typeof out.leader_to_unblock !== "boolean") {
-    out.leader_to_unblock = ok ? shouldLeaderUnblock(r.team_energy, r.ease) : false;
-  }
-  return out;
-}
 
-// ---------- Health ----------
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, table: TABLE, url: SUPABASE_URL });
+  const insert = {
+    content: story,
+    transcript: story,
+    user_id: originator,
+    owner: originator,
+    customer_impact,
+    team_energy,
+    frequency,
+    ease,
+    priority_rank,
+    action_tier,
+    leader_to_unblock,
+    status: "open",
+  };
+
+  const { data, error } = await supabase.from("items").insert(insert).select("*").single();
+
+  if (error) return res.status(500).json({ error: error.message });
+
+  res.status(201).json({
+    ok: true,
+    id: data.id,
+    priority_rank: data.priority_rank || 0,
+    action_tier: data.action_tier || "⚪ Park for later",
+    leader_to_unblock: !!data.leader_to_unblock,
+  });
 });
 
-// ---------- List (ranked by default) ----------
-app.get("/api/list", async (req, res) => {
-  try {
-    const view = String(req.query.view || "ranked").toLowerCase(); // ranked | newest | mine
-    const who = (req.query.who || "").trim(); // user_id or originator_name
+// ---------- update FACTORS (called by UI: POST /items/:id/factors) ----------
+app.post("/items/:id/factors", async (req, res) => {
+  const itemId = req.params.id;
 
-    let q = sb
-      .from(TABLE)
-      .select(
-        "id,content,transcript,originator_name,user_id,created_at,updated_at,status," +
-          "customer_impact,team_energy,frequency,ease,priority_rank,action_tier,leader_to_unblock"
-      )
-      .limit(400);
+  const customer_impact = numOrNull(req.body.customer_impact);
+  const team_energy = numOrNull(req.body.team_energy);
+  const frequency = numOrNull(req.body.frequency);
+  const ease = numOrNull(req.body.ease);
 
-    if (view === "newest") {
-      q = q.order("created_at", { ascending: false });
-    } else {
-      // ranked (default)
-      q = q.order("priority_rank", { ascending: false }).order("created_at", { ascending: false });
+  // Validate
+  for (const [k, v] of Object.entries({
+    customer_impact,
+    team_energy,
+    frequency,
+    ease,
+  })) {
+    if (!Number.isFinite(v) || v < 1 || v > 10) {
+      return res.status(400).json({ error: `Invalid ${k}: must be number 1..10` });
     }
-
-    if (view === "mine" && who) {
-      q = q.or(`originator_name.eq.${who},user_id.eq.${who}`);
-    }
-
-    const { data, error } = await q;
-    if (error) throw error;
-    res.json({ items: (data || []).map(decorateRow) });
-  } catch (e) {
-    console.error("LIST error", e);
-    res.status(500).json({ error: "list_failed" });
   }
-});
 
-// ---------- Detail ----------
-app.get("/api/item/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await sb.from(TABLE).select("*").eq("id", id).single();
-    if (error) throw error;
-    res.json({ item: decorateRow(data) });
-  } catch (e) {
-    res.status(404).json({ error: "not_found" });
-  }
-});
+  const pr = computePriorityRank(customer_impact, team_energy, frequency, ease);
+  const tier = tierForPR(pr);
+  const unblock = shouldLeaderUnblock(team_energy, ease);
 
-// ---------- Create (web form requires all 4 ratings) ----------
-app.post("/api/items", async (req, res) => {
-  try {
-    const {
-      user_id,
-      originator_name,
-      content,
+  const { error } = await supabase
+    .from("items")
+    .update({
       customer_impact,
       team_energy,
       frequency,
       ease,
-    } = req.body || {};
+      priority_rank: pr,
+      action_tier: tier,
+      leader_to_unblock: unblock,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", itemId);
 
-    const ci = clamp1to10(customer_impact);
-    const te = clamp1to10(team_energy);
-    const fr = clamp1to10(frequency);
-    const ez = clamp1to10(ease);
-    if (![ci, te, fr, ez].every((v) => Number.isFinite(v))) {
-      return res.status(400).json({ error: "All four ratings must be integers 1..10." });
-    }
+  if (error) return res.status(500).json({ error: error.message });
 
-    const pr = computePriorityRank(ci, te, fr, ez);
-    const tier = tierForPR(pr);
-    const unblock = shouldLeaderUnblock(te, ez);
-
-    const { data, error } = await sb
-      .from(TABLE)
-      .insert({
-        user_id: user_id || null,
-        originator_name: originator_name || null,
-        content: content || null,
-        customer_impact: ci,
-        team_energy: te,
-        frequency: fr,
-        ease: ez,
-        priority_rank: pr,
-        action_tier: tier,
-        leader_to_unblock: unblock,
-        status: "open",
-        updated_at: new Date().toISOString(),
-      })
-      .select("*")
-      .single();
-
-    if (error) throw error;
-    res.json(decorateRow(data));
-  } catch (e) {
-    console.error("CREATE error", e);
-    res.status(500).json({ error: "create_failed" });
-  }
+  res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
 });
 
-// ---------- Update factors (recalculate) ----------
-app.post("/api/items/:id/factors", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { customer_impact, team_energy, frequency, ease, user_next_step } = req.body || {};
-
-    const ci = clamp1to10(customer_impact);
-    const te = clamp1to10(team_energy);
-    const fr = clamp1to10(frequency);
-    const ez = clamp1to10(ease);
-    if (![ci, te, fr, ez].every((v) => Number.isFinite(v))) {
-      return res.status(400).json({ error: "All four ratings must be integers 1..10." });
-    }
-
-    const pr = computePriorityRank(ci, te, fr, ez);
-    const tier = tierForPR(pr);
-    const unblock = shouldLeaderUnblock(te, ez);
-
-    const { data, error } = await sb
-      .from(TABLE)
-      .update({
-        customer_impact: ci,
-        team_energy: te,
-        frequency: fr,
-        ease: ez,
-        priority_rank: pr,
-        action_tier: tier,
-        leader_to_unblock: unblock,
-        user_next_step: user_next_step ?? null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", id)
-      .select("*")
-      .single();
-
-    if (error) throw error;
-    res.json(decorateRow(data));
-  } catch (e) {
-    console.error("FACTORS error", e);
-    res.status(500).json({ error: "update_failed" });
-  }
-});
-
-// ---------- Twilio SMS (kept simple) ----------
-app.post("/sms", async (req, res) => {
-  const from = req.body?.From || "unknown";
-  const body = (req.body?.Body || "").trim();
-
-  // Minimal STOP/HELP
-  const lower = body.toLowerCase();
-  if (["stop", "stop all", "end", "unsubscribe", "cancel", "quit"].includes(lower)) {
-    const msg = "Got it — text START anytime to use Felma again.";
-    return res.type("text/xml").send(`<?xml version="1.0"?><Response><Message>${msg}</Message></Response>`);
-  }
-  if (lower === "help") {
-    const msg = "Text Felma what you’ve noticed. We’ll log it for your team. Reply STOP to opt out.";
-    return res.type("text/xml").send(`<?xml version="1.0"?><Response><Message>${msg}</Message></Response>`);
-  }
-
-  await sb.from(TABLE).insert({
-    user_id: from,
-    transcript: body,
-    response: "Felma received your text and logged it.",
-    status: "open",
-  });
-
-  const reply = "Thanks — logged. You can finish ratings in the app.";
-  res.type("text/xml").send(`<?xml version="1.0"?><Response><Message>${reply}</Message></Response>`);
-});
-
-// ---------- Start ----------
+// ---------- start ----------
 app.listen(PORT, () => {
-  console.log(`✅ Felma server listening on ${PORT}`);
+  console.log(`✅ Felma backend running on :${PORT}`);
 });
