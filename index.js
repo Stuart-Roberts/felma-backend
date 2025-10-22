@@ -1,6 +1,5 @@
-// Felma backend (Express + Supabase)
-// Requirements: express, @supabase/supabase-js, compression, dotenv
-// ENV needed on Render: SUPABASE_URL, SUPABASE_KEY
+// index.js — Felma backend (Express + Supabase)
+// Node 18+ recommended. Needs SUPABASE_URL and SUPABASE_KEY (service role) in env.
 
 const express = require("express");
 const compression = require("compression");
@@ -12,7 +11,7 @@ app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Very simple CORS for the pilot
+// Simple CORS for UI
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -23,7 +22,7 @@ app.use((req, res, next) => {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ---------- Helpers: ranking, tiers, leader flag ----------
+// ---------- Helpers (rank, tier, leader flag) ----------
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
   // PR = round( (0.57*Customer + 0.43*Team) * (0.6*Frequency + 0.4*Ease) )
   const a = 0.57 * customer_impact + 0.43 * team_energy;
@@ -38,175 +37,166 @@ function tierForPR(pr) {
   return "⚪ Park for later";
 }
 function shouldLeaderUnblock(team_energy, ease) {
-  // Agreed rule: Team Energy >= 9 AND Ease <= 3
-  return team_energy >= 9 && ease <= 3;
+  // Agreed rule: Team_Energy >= 9 AND Ease <= 3
+  return Number(team_energy) >= 9 && Number(ease) <= 3;
 }
-function coalesceTitle(row) {
-  const t = (row.content ?? row.transcript ?? "").trim();
-  return t.length ? t : "(untitled)";
+function toInt01(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+function displayTitle(row) {
+  // Always give the UI something to show
+  const t = (row?.title ?? "").trim();
+  if (t) return t;
+  const s = (row?.content ?? row?.story ?? row?.transcript ?? "").trim();
+  return s || "(untitled)";
 }
 
 // ---------- Health ----------
-app.get("/api/health", (req, res) => {
-  res.json({ ok: true, table: "items", url: process.env.SUPABASE_URL || "" });
+app.get("/", (req, res) => {
+  res.json({ ok: true, table: "items", url: process.env.SUPABASE_URL || null });
 });
+app.get("/api/health", (req, res) => res.json({ ok: true }));
 
-// ---------- People (for phone/email -> display names) ----------
-app.get("/api/people", async (req, res) => {
+// ---------- People (for phone/email → display name, leader) ----------
+app.get("/api/people", async (_req, res) => {
   const { data, error } = await supabase
     .from("profiles")
-    .select("phone, email, full_name, display_name, is_leader")
-    .order("full_name", { ascending: true });
+    .select("id, email, phone, display_name, is_leader, org_slug")
+    .order("display_name", { ascending: true });
 
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  res.json({ people: data || [] });
 });
 
-// ---------- Items list (rank/newest/mine) ----------
-app.get("/api/list", async (req, res) => {
-  const view = (req.query.view || "rank").toLowerCase(); // "rank" | "new" | "mine"
-  const me = (req.query.me || "").trim();                // phone for now (E.164)
-
-  let query = supabase
+// ---------- List items (ranked first, then newest) ----------
+app.get("/api/list", async (_req, res) => {
+  const { data, error } = await supabase
     .from("items")
-    .select("id, content, transcript, created_at, user_id, priority_rank, action_tier, leader_to_unblock")
-    .limit(400);
+    .select(
+      "id, title, content, story, transcript, created_at, updated_at, user_id, priority_rank, action_tier, leader_to_unblock, status"
+    )
+    .order("priority_rank", { ascending: false, nullsFirst: false })
+    .order("created_at", { ascending: false });
 
-  if (view === "mine" && me) {
-    query = query.eq("user_id", me).order("created_at", { ascending: false });
-  } else if (view === "new" || view === "newest") {
-    query = query.order("created_at", { ascending: false });
-  } else {
-    // default: rank
-    // sort by rank desc, then newest
-    query = query
-      .order("priority_rank", { ascending: false, nullsFirst: false })
-      .order("created_at", { ascending: false });
-  }
-
-  const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
 
+  // Guarantee a title in the payload
   const items = (data || []).map((r) => ({
     id: r.id,
-    title: coalesceTitle(r),
+    title: displayTitle(r),
     created_at: r.created_at,
-    user_id: r.user_id, // front-end maps to display name via /api/people
-    priority_rank: r.priority_rank ?? 0,
-    action_tier: r.action_tier || "⚪ Park for later",
+    updated_at: r.updated_at,
+    user_id: r.user_id,
+    priority_rank: toInt01(r.priority_rank),
+    action_tier: r.action_tier || null,
     leader_to_unblock: !!r.leader_to_unblock,
+    status: r.status || "open",
   }));
 
   res.json({ items });
 });
 
-// ---------- Add new item (with optional immediate factors) ----------
+// ---------- Add new item ----------
 app.post("/items/new", async (req, res) => {
-  const {
-    content,
-    transcript,
-    user_id,         // for now: phone (E.164). Later: auth user id.
-    org,             // optional
-    org_slug,        // optional
-    customer_impact, // optional 1..10
-    team_energy,     // optional 1..10
-    frequency,       // optional 1..10
-    ease             // optional 1..10
-  } = req.body || {};
-
-  const title = ((content ?? transcript ?? "").trim()) || "(untitled)";
-  const now = new Date().toISOString();
-
-  let pr = null, tier = null, unblock = null;
-
-  const hasAllFactors =
-    [customer_impact, team_energy, frequency, ease].every(
-      (n) => typeof n === "number" && n >= 1 && n <= 10
-    );
-
-  if (hasAllFactors) {
-    pr = computePriorityRank(customer_impact, team_energy, frequency, ease);
-    tier = tierForPR(pr);
-    unblock = shouldLeaderUnblock(team_energy, ease);
-  }
-
-  const insertPayload = {
-    content: title,
-    transcript: (transcript ?? null),
-    user_id: user_id ?? null,
-    org: org ?? null,
-    org_slug: org_slug ?? null,
-    priority_rank: pr,
-    action_tier: tier,
-    leader_to_unblock: unblock,
-    customer_impact: hasAllFactors ? customer_impact : null,
-    team_energy:     hasAllFactors ? team_energy     : null,
-    frequency:       hasAllFactors ? frequency       : null,
-    ease:            hasAllFactors ? ease            : null,
-    status: "open",
-    created_at: now,
-    updated_at: now
-  };
-
-  const { data, error } = await supabase
-    .from("items")
-    .insert(insertPayload)
-    .select("*")
-    .single();
-
-  if (error) return res.status(500).json({ error: error.message });
-
-  res.json({
-    ok: true,
-    item: {
-      id: data.id,
-      title: coalesceTitle(data),
-      created_at: data.created_at,
-      user_id: data.user_id,
-      priority_rank: data.priority_rank ?? 0,
-      action_tier: data.action_tier || "⚪ Park for later",
-      leader_to_unblock: !!data.leader_to_unblock,
-    },
-  });
-});
-
-// ---------- Update factors for an item ----------
-app.post("/items/:id/factors", async (req, res) => {
-  const itemId = req.params.id;
-  const { customer_impact, team_energy, frequency, ease, user_next_step } = req.body || {};
-
-  const nums = { customer_impact, team_energy, frequency, ease };
-  for (const [k, v] of Object.entries(nums)) {
-    if (typeof v !== "number" || v < 1 || v > 10) {
-      return res.status(400).json({ error: `Invalid ${k}: must be 1..10` });
-    }
-  }
-
-  const pr = computePriorityRank(customer_impact, team_energy, frequency, ease);
-  const tier = tierForPR(pr);
-  const unblock = shouldLeaderUnblock(team_energy, ease);
-
-  const { error } = await supabase
-    .from("items")
-    .update({
+  try {
+    // From UI
+    const {
+      title,
+      originator, // phone or user id (we just store it in user_id column)
       customer_impact,
       team_energy,
       frequency,
       ease,
+    } = req.body || {};
+
+    // Validate 1..10
+    const nums = {
+      customer_impact: Number(customer_impact),
+      team_energy: Number(team_energy),
+      frequency: Number(frequency),
+      ease: Number(ease),
+    };
+    for (const [k, v] of Object.entries(nums)) {
+      if (!Number.isFinite(v) || v < 1 || v > 10) {
+        return res.status(400).json({ error: `Invalid ${k} (must be 1..10)` });
+      }
+    }
+
+    const pr = computePriorityRank(nums.customer_impact, nums.team_energy, nums.frequency, nums.ease);
+    const tier = tierForPR(pr);
+    const unblock = shouldLeaderUnblock(nums.team_energy, nums.ease);
+
+    const insert = {
+      title: (title || "").trim() || "(untitled)",
+      user_id: originator || null,
+      customer_impact: nums.customer_impact,
+      team_energy: nums.team_energy,
+      frequency: nums.frequency,
+      ease: nums.ease,
       priority_rank: pr,
       action_tier: tier,
       leader_to_unblock: unblock,
-      user_next_step: user_next_step ?? null,
+      status: "open",
       updated_at: new Date().toISOString(),
-    })
-    .eq("id", itemId);
+    };
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
+    const { data, error } = await supabase.from("items").insert(insert).select("id").single();
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ ok: true, id: data.id, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
+  } catch (e) {
+    console.error("POST /items/new error", e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ---------- Update factors on an existing item ----------
+app.post("/items/:id/factors", async (req, res) => {
+  try {
+    const itemId = req.params.id;
+    const { customer_impact, team_energy, frequency, ease, user_next_step } = req.body || {};
+    const nums = {
+      customer_impact: Number(customer_impact),
+      team_energy: Number(team_energy),
+      frequency: Number(frequency),
+      ease: Number(ease),
+    };
+    for (const [k, v] of Object.entries(nums)) {
+      if (!Number.isFinite(v) || v < 1 || v > 10) {
+        return res.status(400).json({ error: `Invalid ${k} (must be 1..10)` });
+      }
+    }
+
+    const pr = computePriorityRank(nums.customer_impact, nums.team_energy, nums.frequency, nums.ease);
+    const tier = tierForPR(pr);
+    const unblock = shouldLeaderUnblock(nums.team_energy, nums.ease);
+
+    const { error } = await supabase
+      .from("items")
+      .update({
+        customer_impact: nums.customer_impact,
+        team_energy: nums.team_energy,
+        frequency: nums.frequency,
+        ease: nums.ease,
+        priority_rank: pr,
+        action_tier: tier,
+        leader_to_unblock: unblock,
+        user_next_step: user_next_step ?? null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", itemId);
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
+  } catch (e) {
+    console.error("POST /items/:id/factors error", e);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // ---------- Start ----------
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
-  console.log(`Felma backend listening on ${port}\n>> Your service is live ✅`);
+  console.log(`Felma backend listening on ${port}`);
 });
