@@ -1,5 +1,5 @@
-// Felma backend - pilot build (org-aware + safe titles)
-// Requirements in Render env: SUPABASE_URL, SUPABASE_KEY, (optional) DEFAULT_ORG
+// Felma backend - pilot build (org-aware + safe titles, legacy rows included)
+// Env in Render: SUPABASE_URL, SUPABASE_KEY, DEFAULT_ORG=stmichaels
 
 const express = require("express");
 const compression = require("compression");
@@ -10,7 +10,7 @@ app.use(compression());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Simple CORS (UI is on a different origin)
+// Simple CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -19,10 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Supabase client ----
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// ---- Helpers ----
 const DEFAULT_ORG = process.env.DEFAULT_ORG || null;
 
 function fallbackTitle(row) {
@@ -33,7 +30,6 @@ function fallbackTitle(row) {
 }
 
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
-  // PR = round( (0.57*Customer + 0.43*Team) * (0.6*Frequency + 0.4*Ease) )
   const a = 0.57 * customer_impact + 0.43 * team_energy;
   const b = 0.6 * frequency + 0.4 * ease;
   return Math.round(a * b);
@@ -46,16 +42,14 @@ function tierForPR(pr) {
   return "⚪ Park for later";
 }
 function shouldLeaderUnblock(team_energy, ease) {
-  // Pilot rule (your chosen one)
   return team_energy >= 9 && ease <= 3;
 }
 
-// ---- Health ----
+// Health
 app.get("/", (_req, res) => res.send("Felma backend up."));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ---- People (profiles) ----
-// Optional filter: /api/people?org=stmichaels
+// People
 app.get("/api/people", async (req, res) => {
   const org = (req.query.org || DEFAULT_ORG || "").trim();
   let q = supabase.from("profiles").select("id,email,phone,display_name,full_name,is_leader,org_slug");
@@ -65,8 +59,7 @@ app.get("/api/people", async (req, res) => {
   res.json({ people: data || [] });
 });
 
-// ---- Items list ----
-// Optional filter: /api/list?org=stmichaels
+// Items list (includes legacy NULL org rows so your old data shows)
 app.get("/api/list", async (req, res) => {
   const org = (req.query.org || DEFAULT_ORG || "").trim();
 
@@ -76,31 +69,24 @@ app.get("/api/list", async (req, res) => {
       "id,created_at,title,transcript,user_id,org_slug,priority_rank,action_tier,leader_to_unblock,customer_impact,team_energy,frequency,ease"
     );
 
-  if (org) q = q.eq("org_slug", org);
+  // Key tweak: include legacy NULL org rows as well
+  if (org) q = q.or(`org_slug.eq.${org},org_slug.is.null`);
 
-  // Order: rank desc (nulls last), then newest first
   q = q.order("priority_rank", { ascending: false, nullsFirst: false })
        .order("created_at", { ascending: false });
 
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
 
-  const items = (data || []).map((r) => ({
-    ...r,
-    title: fallbackTitle(r),
-  }));
-
+  const items = (data || []).map((r) => ({ ...r, title: fallbackTitle(r) }));
   res.json({ items });
 });
 
-// ---- Add new item ----
-// POST /items/new  body: { title?, transcript?, user_id?, org_slug?, customer_impact?, team_energy?, frequency?, ease? }
+// Add new item
 app.post("/items/new", async (req, res) => {
   const body = req.body || {};
-
   const org = (body.org_slug || req.query.org || DEFAULT_ORG || "").trim() || null;
   const user_id = (body.user_id || "").trim() || null;
-
   const title = typeof body.title === "string" ? body.title : null;
   const transcript = typeof body.transcript === "string" ? body.transcript : null;
 
@@ -141,8 +127,7 @@ app.post("/items/new", async (req, res) => {
   res.json({ ok: true, item: data });
 });
 
-// ---- Update 4 factors for an item ----
-// POST /items/:id/factors  body: { customer_impact, team_energy, frequency, ease }
+// Update 4 factors
 app.post("/items/:id/factors", async (req, res) => {
   const id = req.params.id;
   const { customer_impact, team_energy, frequency, ease } = req.body || {};
@@ -180,7 +165,6 @@ app.post("/items/:id/factors", async (req, res) => {
   res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
 });
 
-// ---- Start server ----
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`✅ Felma backend running on :${port}`);
