@@ -1,187 +1,201 @@
-// index.js — CommonJS (require) so it runs with `node index.js` on Render
-const express = require("express");
-const cors = require("cors");
-const { Pool } = require("pg");
-require("dotenv").config();
+// index.js — CommonJS backend for Felma
+require('dotenv').config();
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : false,
-});
+const express = require('express');
+const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
-// ---------- Rank + Tier logic ----------
-function computePriorityRank(customer_impact, team_energy, frequency, ease) {
-  const ci = Number(customer_impact || 0);
-  const te = Number(team_energy || 0);
-  const fr = Number(frequency || 0);
-  const es = Number(ease || 0);
-  const a = 0.57 * ci + 0.43 * te;
-  const b = 0.6 * fr + 0.4 * es;
-  return Math.round(a * b);
-}
-function tierForPR(pr) {
-  if (pr >= 70) return "🔥 Make it happen";
-  if (pr >= 50) return "🚀 Act on it now";
-  if (pr >= 36) return "🧭 Move it forward";
-  if (pr >= 25) return "🙂 When time allows";
-  return "⚪ Park for later";
-}
-function shouldLeaderUnblock(team_energy, ease) {
-  return Number(team_energy) >= 9 && Number(ease) <= 3;
-}
+// ---- DB ---------------------------------------------------------------------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+});
 
-// ---------- helpers ----------
-function shortTitleFrom(transcript, fallback = "(untitled)") {
-  const t = (transcript || "").trim().replace(/\s+/g, " ");
-  if (!t) return fallback;
-  return t.slice(0, 80);
-}
-function normPhone(s) {
-  if (!s) return null;
-  return String(s).replace(/[^\d+]/g, "");
-}
-
-// ---------- routes ----------
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-
-// People directory (names for phones) — filter by org if provided
-app.get("/api/people", async (req, res) => {
-  const org = req.query.org || null;
+async function q(sql, params = []) {
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
-      `
-      select id, email, phone, display_name, is_leader, org_slug
-      from public.profiles
-      where ($1::text is null or org_slug = $1)
-    `,
-      [org]
+    const res = await client.query(sql, params);
+    return res.rows;
+  } finally {
+    client.release();
+  }
+}
+
+// Helper: produce a safe title (server-side fallback)
+const SAFE_TITLE_SQL = `
+COALESCE(
+  NULLIF(btrim(i.title), ''),
+  COALESCE(
+    NULLIF(LEFT(regexp_replace(btrim(COALESCE(i.transcript, '')), '\\s+', ' ', 'g'), 80), ''),
+    '(untitled)'
+  )
+) AS title
+`;
+
+// ---- Routes -----------------------------------------------------------------
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+// People list for mapping phone -> display_name (names in UI)
+app.get('/api/people', async (req, res) => {
+  try {
+    const rows = await q(
+      `SELECT id, email, phone, display_name, is_leader, org_slug
+         FROM public.profiles
+        ORDER BY display_name NULLS LAST, email NULLS LAST;`
     );
     res.json({ people: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error('GET /api/people error:', err);
+    res.status(500).json({ error: err.message || 'people_failed' });
   }
 });
 
-// Items list — returns title even if DB title is null/empty
-app.get("/api/list", async (req, res) => {
-  const org = req.query.org || null;
+// Main list (optionally filter by org)
+app.get('/api/list', async (req, res) => {
+  const org = (req.query.org || '').trim() || null;
+
+  const params = [];
+  const where = [];
+  if (org) {
+    params.push(org);
+    where.push(`i.org_slug = $${params.length}`);
+  }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const sql = `
+    SELECT
+      i.id,
+      i.created_at,
+      ${SAFE_TITLE_SQL},
+      i.priority_rank,
+      i.action_tier,
+      i.leader_to_unblock,
+      i.customer_impact, i.team_energy, i.frequency, i.ease,
+      i.org_slug,
+      i."user" AS phone,
+      p.display_name
+    FROM public.items i
+    LEFT JOIN public.profiles p
+      ON p.phone = i."user"
+    ${whereSql}
+    ORDER BY i.priority_rank DESC NULLS LAST, i.created_at DESC
+    LIMIT 500;
+  `;
+
   try {
-    const { rows } = await pool.query(
-      `
-      select
-        id,
-        created_at,
-        coalesce(nullif(title,''), left(regexp_replace(btrim(coalesce(transcript,'')), '\\s+', ' ', 'g'), 80), '(untitled)') as title,
-        "user",             -- legacy phone field (text)
-        user_id,            -- future auth link
-        priority_rank,
-        action_tier,
-        leader_to_unblock,
-        customer_impact,
-        team_energy,
-        frequency,
-        ease,
-        org_slug
-      from public.items
-      where ($1::text is null or org_slug = $1)
-      order by priority_rank desc nulls last, created_at desc
-    `,
-      [org]
-    );
+    const rows = await q(sql, params);
     res.json({ items: rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error('GET /api/list error:', err);
+    res.status(500).json({ error: err.message || 'list_failed' });
   }
 });
 
-// Create new item
-app.post("/items/new", async (req, res) => {
+// Create a new item
+app.post('/items/new', async (req, res) => {
   try {
-    const org = req.body.org || req.query.org || "stmichaels";
-    const user = normPhone(req.body.user) || null; // phone (pilot)
-    const rawTitle = (req.body.title || "").trim();
-    const transcript = (req.body.transcript || "").trim();
-    const title = rawTitle || shortTitleFrom(transcript);
+    const {
+      title = '',
+      transcript = '',
+      phone = null,          // originator phone (for now)
+      org = null,            // org_slug
+      customer_impact = null,
+      team_energy = null,
+      frequency = null,
+      ease = null,
+    } = req.body || {};
 
-    const { rows } = await pool.query(
+    const rows = await q(
       `
-      insert into public.items (title, transcript, "user", org_slug)
-      values ($1, $2, $3, $4)
-      returning id, created_at, title, "user", org_slug
-    `,
-      [title, transcript, user, org]
+      INSERT INTO public.items
+        (title, transcript, "user", org_slug, customer_impact, team_energy, frequency, ease)
+      VALUES
+        (
+          COALESCE(
+            NULLIF($1, ''),
+            COALESCE(
+              NULLIF(LEFT(regexp_replace(btrim(COALESCE($2, '')), '\\s+', ' ', 'g'), 80), ''),
+              '(untitled)'
+            )
+          ),
+          $2, $3, $4, $5, $6, $7, $8
+        )
+      RETURNING id;
+      `,
+      [title, transcript, phone, org, customer_impact, team_energy, frequency, ease]
     );
-    res.json({ ok: true, item: rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+
+    res.json({ ok: true, id: rows[0]?.id });
+  } catch (err) {
+    console.error('POST /items/new error:', err);
+    res.status(500).json({ error: err.message || 'create_failed' });
   }
 });
 
-// Save 4 factors + derived rank/tier/unblock
-app.post("/items/:id/factors", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const { customer_impact, team_energy, frequency, ease } = req.body;
+// Update the 4 rating factors (and optionally action flags)
+app.post('/items/:id/factors', async (req, res) => {
+  const id = req.params.id;
+  const {
+    customer_impact = null,
+    team_energy = null,
+    frequency = null,
+    ease = null,
+    action_tier = null,       // optional
+    leader_to_unblock = null  // optional
+  } = req.body || {};
 
-    const pr = computePriorityRank(customer_impact, team_energy, frequency, ease);
-    const tier = tierForPR(pr);
-    const unblock = shouldLeaderUnblock(team_energy, ease);
-
-    const { rows } = await pool.query(
-      `
-      update public.items
-      set customer_impact = $2,
-          team_energy     = $3,
-          frequency       = $4,
-          ease            = $5,
-          priority_rank   = $6,
-          action_tier     = $7,
-          leader_to_unblock = $8
-      where id = $1
-      returning id, priority_rank, action_tier, leader_to_unblock,
-                customer_impact, team_energy, frequency, ease
-    `,
-      [id, customer_impact, team_energy, frequency, ease, pr, tier, unblock]
-    );
-    res.json({ ok: true, item: rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Update title (originator-only by phone match, pilot rule)
-app.post("/items/:id/title", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const requester = normPhone(req.body.user) || "";
-    const title = (req.body.title || "").trim().slice(0, 80) || "(untitled)";
-
-    const { rows: chk } = await pool.query(
-      `select "user" from public.items where id = $1`,
-      [id]
-    );
-    if (!chk.length) return res.status(404).json({ error: "Not found" });
-
-    const origin = normPhone(chk[0].user);
-    if (origin && requester && origin !== requester) {
-      return res.status(403).json({ error: "Only originator can edit title (pilot rule)" });
+  // Build dynamic update with only provided fields
+  const sets = [];
+  const params = [];
+  function add(column, value) {
+    if (value !== null && value !== undefined) {
+      params.push(value);
+      sets.push(`${column} = $${params.length}`);
     }
+  }
+  add('customer_impact', customer_impact);
+  add('team_energy', team_energy);
+  add('frequency', frequency);
+  add('ease', ease);
+  add('action_tier', action_tier);
+  add('leader_to_unblock', leader_to_unblock);
 
-    const { rows } = await pool.query(
-      `update public.items set title = $2 where id = $1 returning id, title`,
-      [id, title]
-    );
+  if (sets.length === 0) {
+    return res.json({ ok: true, id }); // nothing to update
+  }
+
+  params.push(id);
+
+  const sql = `
+    UPDATE public.items
+       SET ${sets.join(', ')}
+     WHERE id = $${params.length}
+     RETURNING id, customer_impact, team_energy, frequency, ease, priority_rank, action_tier, leader_to_unblock;
+  `;
+
+  try {
+    const rows = await q(sql, params);
     res.json({ ok: true, item: rows[0] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (err) {
+    console.error('POST /items/:id/factors error:', err);
+    res.status(500).json({ error: err.message || 'update_failed' });
   }
 });
 
-const PORT = Number(process.env.PORT) || 10000;
+// Root
+app.get('/', (req, res) => {
+  res.json({ ok: true, service: 'felma-backend' });
+});
+
+// ---- Start ------------------------------------------------------------------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log("felma-backend running on", PORT);
+  console.log(`felma-backend running on :${PORT}`);
 });
