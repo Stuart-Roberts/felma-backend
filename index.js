@@ -1,11 +1,9 @@
-// index.js — full clean file
-import express from "express";
-import cors from "cors";
-import pkg from "pg";
-import dotenv from "dotenv";
-dotenv.config();
+// index.js — CommonJS (require) so it runs with `node index.js` on Render
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+require("dotenv").config();
 
-const { Pool } = pkg;
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : false,
@@ -104,7 +102,7 @@ app.get("/api/list", async (req, res) => {
 app.post("/items/new", async (req, res) => {
   try {
     const org = req.body.org || req.query.org || "stmichaels";
-    const user = normPhone(req.body.user) || null; // phone as text for pilot
+    const user = normPhone(req.body.user) || null; // phone (pilot)
     const rawTitle = (req.body.title || "").trim();
     const transcript = (req.body.transcript || "").trim();
     const title = rawTitle || shortTitleFrom(transcript);
@@ -155,7 +153,7 @@ app.post("/items/:id/factors", async (req, res) => {
   }
 });
 
-// Update title (pilot-grade: allow originator only by phone match)
+// Update title (originator-only by phone match, pilot rule)
 app.post("/items/:id/title", async (req, res) => {
   try {
     const id = req.params.id;
@@ -183,7 +181,7 @@ app.post("/items/:id/title", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
 app.listen(PORT, () => {
   console.log("felma-backend running on", PORT);
 });
