@@ -1,58 +1,84 @@
-// CommonJS backend for Render + Supabase (postgres)
-// Minimal, safe CORS and robust title fallback.
+// Minimal Express backend (Render) using Supabase HTTP client
+// Keeps all routes and avoids direct Postgres TCP (no ENETUNREACH)
 
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const { createClient } = require("@supabase/supabase-js");
 
-const app = express();
 const PORT = process.env.PORT || 10000;
 
-// CORS: permissive for now to avoid invalid header values
-app.use(cors());
+// ── CORS ───────────────────────────────────────────────────────────────────────
+const app = express();
 app.use(express.json());
 
-// ---- Database pool ----
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL env var");
+const allowedOrigin = process.env.CORS_ORIGIN?.trim();
+app.use(
+  cors({
+    origin: allowedOrigin || false, // false = no CORS; set CORS_ORIGIN in Render
+    credentials: false
+  })
+);
+
+// ── Supabase client (use SERVICE ROLE if you have RLS anywhere) ───────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const ADMIN_KEY = process.env.ADMIN_KEY || process.env.SUPABASE_KEY; // service role preferred
+
+if (!SUPABASE_URL || !ADMIN_KEY) {
+  console.error("Missing SUPABASE_URL or ADMIN_KEY env vars!");
 }
-const pool = new Pool({
-  connectionString: DATABASE_URL,            // include ?sslmode=require in the value
-  max: 4,
-  ssl: { rejectUnauthorized: false }         // fine for Supabase
+
+const sb = createClient(SUPABASE_URL, ADMIN_KEY, {
+  auth: { persistSession: false }
 });
 
-// Utility: safe title from transcript
-function ensureTitle(row) {
-  const t = (row.title && row.title.trim())
-    ? row.title.trim()
-    : (row.transcript && row.transcript.trim()
-        ? row.transcript.trim().replace(/\s+/g, " ").slice(0, 80)
-        : "(untitled)");
-  return { ...row, title: t };
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const TABLE = process.env.TABLE_NAME || "items";
+const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
+
+function safeTitle(title, transcript) {
+  const t = (title || "").trim();
+  if (t.length > 0) return t;
+  const body = (transcript || "").trim();
+  if (body.length === 0) return "(untitled)";
+  // collapse whitespace and cap at 80 chars
+  return body.replace(/\s+/g, " ").slice(0, 80);
 }
 
-// ---- Routes ----
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+// ── Routes ────────────────────────────────────────────────────────────────────
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 app.get("/api/list", async (req, res) => {
   try {
-    const org = req.query.org || null;
-    const params = [];
-    let where = "";
-    if (org) { params.push(org); where = "where coalesce(org_slug, $1) = $1"; }
+    const org = (req.query.org || DEFAULT_ORG || "").trim();
 
-    const q = `
-      select id, created_at, user_id, title, transcript, phone, originator_name,
-             priority_rank, action_tier, leader_to_unblock,
-             customer_impact, team_energy, frequency, ease, org_slug
-      from public.items
-      ${where}
-      order by coalesce(priority_rank, 0) desc, created_at desc
-    `;
-    const { rows } = await pool.query(q, params);
-    res.json({ items: rows.map(ensureTitle) });
+    let q = sb
+      .from(TABLE)
+      .select(
+        `
+        id, created_at, user_id, phone, originator_name,
+        title, transcript, org_slug,
+        priority_rank, action_tier, leader_to_unblock,
+        customer_impact, team_energy, frequency, ease
+      `
+      );
+
+    if (org) q = q.eq("org_slug", org);
+
+    // Order: higher rank first, newest first; nulls last
+    q = q.order("priority_rank", { ascending: false, nullsFirst: false })
+         .order("created_at", { ascending: false });
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const items = (data || []).map((r) => ({
+      ...r,
+      title: safeTitle(r.title, r.transcript)
+    }));
+
+    res.json({ items });
   } catch (err) {
     console.error("GET /api/list error:", err);
     res.status(500).json({ error: "list_failed" });
@@ -61,18 +87,20 @@ app.get("/api/list", async (req, res) => {
 
 app.get("/api/people", async (_req, res) => {
   try {
-    const { rows } = await pool.query(`
-      select id, email, phone, display_name, full_name, is_leader, org_slug
-      from public.profiles
-    `);
-    const people = rows.map(p => ({
+    const { data, error } = await sb
+      .from("profiles")
+      .select("id, display_name, full_name, is_leader, org_slug, phone, email");
+    if (error) throw error;
+
+    const people = (data || []).map((p) => ({
       id: p.id,
-      email: p.email,
-      phone: p.phone,
-      org_slug: p.org_slug,
-      display_name: p.display_name || p.full_name || p.email || p.phone || "Unknown",
+      org_slug: p.org_slug || null,
       is_leader: !!p.is_leader,
+      display_name: p.display_name || p.full_name || p.phone || "Unknown",
+      email: p.email || null,
+      phone: p.phone || null
     }));
+
     res.json({ people });
   } catch (err) {
     console.error("GET /api/people error:", err);
@@ -82,18 +110,30 @@ app.get("/api/people", async (_req, res) => {
 
 app.post("/items/new", async (req, res) => {
   try {
-    const { org_slug, user_id, phone, originator_name, transcript, title } = req.body || {};
-    const safeTitle = (title && title.trim())
-      ? title.trim()
-      : (transcript ? transcript.trim().replace(/\s+/g, " ").slice(0, 80) : "(untitled)");
+    const {
+      org = DEFAULT_ORG,
+      user_id = null,
+      phone = null,
+      originator_name = null,
+      transcript = "",
+      title = ""
+    } = req.body || {};
 
-    const { rows } = await pool.query(
-      `insert into public.items (org_slug, user_id, phone, originator_name, transcript, title)
-       values ($1,$2,$3,$4,$5,$6)
-       returning id`,
-      [org_slug || null, user_id || null, phone || null, originator_name || null, transcript || null, safeTitle]
-    );
-    res.json({ ok: true, id: rows[0].id });
+    const finalTitle = safeTitle(title, transcript);
+
+    const payload = {
+      org_slug: org,
+      user_id,
+      phone,
+      originator_name,
+      transcript: transcript || null,
+      title: finalTitle
+    };
+
+    const { data, error } = await sb.from(TABLE).insert(payload).select("id").single();
+    if (error) throw error;
+
+    res.json({ ok: true, id: data.id });
   } catch (err) {
     console.error("POST /items/new error:", err);
     res.status(500).json({ error: "create_failed" });
@@ -102,22 +142,30 @@ app.post("/items/new", async (req, res) => {
 
 app.post("/items/:id/factors", async (req, res) => {
   try {
-    const id = req.params.id;
+    const { id } = req.params;
     const {
-      customer_impact, team_energy, frequency, ease,
-      priority_rank, action_tier, leader_to_unblock
+      customer_impact = null,
+      team_energy = null,
+      frequency = null,
+      ease = null,
+      priority_rank = null,
+      action_tier = null,
+      leader_to_unblock = null
     } = req.body || {};
 
-    await pool.query(
-      `update public.items set
-         customer_impact = $1, team_energy = $2, frequency = $3, ease = $4,
-         priority_rank = $5, action_tier = $6, leader_to_unblock = $7
-       where id = $8`,
-      [
-        customer_impact ?? null, team_energy ?? null, frequency ?? null, ease ?? null,
-        priority_rank ?? null, action_tier ?? null, leader_to_unblock ?? false, id
-      ]
-    );
+    const update = {
+      customer_impact,
+      team_energy,
+      frequency,
+      ease,
+      priority_rank,
+      action_tier,
+      leader_to_unblock
+    };
+
+    const { error } = await sb.from(TABLE).update(update).eq("id", id);
+    if (error) throw error;
+
     res.json({ ok: true });
   } catch (err) {
     console.error("POST /items/:id/factors error:", err);
@@ -125,6 +173,7 @@ app.post("/items/:id/factors", async (req, res) => {
   }
 });
 
+// ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log("felma-backend running on", PORT);
+  console.log(`felma-backend running on ${PORT}`);
 });
