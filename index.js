@@ -1,37 +1,28 @@
-// Felma backend - pilot build (org-aware + safe titles, legacy rows included)
-// Env in Render: SUPABASE_URL, SUPABASE_KEY, DEFAULT_ORG=stmichaels
+// index.js — full clean file
+import express from "express";
+import cors from "cors";
+import pkg from "pg";
+import dotenv from "dotenv";
+dotenv.config();
 
-const express = require("express");
-const compression = require("compression");
-const { createClient } = require("@supabase/supabase-js");
-
-const app = express();
-app.use(compression());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
-// Simple CORS
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
+const { Pool } = pkg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : false,
 });
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const DEFAULT_ORG = process.env.DEFAULT_ORG || null;
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
 
-function fallbackTitle(row) {
-  if (row?.title && row.title.trim().length) return row.title.trim();
-  const t = (row?.transcript || "").trim().replace(/\s+/g, " ");
-  if (t.length) return t.slice(0, 80);
-  return "(untitled)";
-}
-
+// ---------- Rank + Tier logic ----------
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
-  const a = 0.57 * customer_impact + 0.43 * team_energy;
-  const b = 0.6 * frequency + 0.4 * ease;
+  const ci = Number(customer_impact || 0);
+  const te = Number(team_energy || 0);
+  const fr = Number(frequency || 0);
+  const es = Number(ease || 0);
+  const a = 0.57 * ci + 0.43 * te;
+  const b = 0.6 * fr + 0.4 * es;
   return Math.round(a * b);
 }
 function tierForPR(pr) {
@@ -42,130 +33,157 @@ function tierForPR(pr) {
   return "⚪ Park for later";
 }
 function shouldLeaderUnblock(team_energy, ease) {
-  return team_energy >= 9 && ease <= 3;
+  return Number(team_energy) >= 9 && Number(ease) <= 3;
 }
 
-// Health
-app.get("/", (_req, res) => res.send("Felma backend up."));
+// ---------- helpers ----------
+function shortTitleFrom(transcript, fallback = "(untitled)") {
+  const t = (transcript || "").trim().replace(/\s+/g, " ");
+  if (!t) return fallback;
+  return t.slice(0, 80);
+}
+function normPhone(s) {
+  if (!s) return null;
+  return String(s).replace(/[^\d+]/g, "");
+}
+
+// ---------- routes ----------
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// People
+// People directory (names for phones) — filter by org if provided
 app.get("/api/people", async (req, res) => {
-  const org = (req.query.org || DEFAULT_ORG || "").trim();
-  let q = supabase.from("profiles").select("id,email,phone,display_name,full_name,is_leader,org_slug");
-  if (org) q = q.eq("org_slug", org);
-  const { data, error } = await q.order("display_name", { ascending: true });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ people: data || [] });
-});
-
-// Items list (includes legacy NULL org rows so your old data shows)
-app.get("/api/list", async (req, res) => {
-  const org = (req.query.org || DEFAULT_ORG || "").trim();
-
-  let q = supabase
-    .from("items")
-    .select(
-      "id,created_at,title,transcript,user_id,org_slug,priority_rank,action_tier,leader_to_unblock,customer_impact,team_energy,frequency,ease"
+  const org = req.query.org || null;
+  try {
+    const { rows } = await pool.query(
+      `
+      select id, email, phone, display_name, is_leader, org_slug
+      from public.profiles
+      where ($1::text is null or org_slug = $1)
+    `,
+      [org]
     );
-
-  // Key tweak: include legacy NULL org rows as well
-  if (org) q = q.or(`org_slug.eq.${org},org_slug.is.null`);
-
-  q = q.order("priority_rank", { ascending: false, nullsFirst: false })
-       .order("created_at", { ascending: false });
-
-  const { data, error } = await q;
-  if (error) return res.status(500).json({ error: error.message });
-
-  const items = (data || []).map((r) => ({ ...r, title: fallbackTitle(r) }));
-  res.json({ items });
-});
-
-// Add new item
-app.post("/items/new", async (req, res) => {
-  const body = req.body || {};
-  const org = (body.org_slug || req.query.org || DEFAULT_ORG || "").trim() || null;
-  const user_id = (body.user_id || "").trim() || null;
-  const title = typeof body.title === "string" ? body.title : null;
-  const transcript = typeof body.transcript === "string" ? body.transcript : null;
-
-  const c = Number(body.customer_impact);
-  const t = Number(body.team_energy);
-  const f = Number(body.frequency);
-  const e = Number(body.ease);
-
-  const haveAllFour =
-    [c, t, f, e].every((n) => Number.isFinite(n)) &&
-    c >= 1 && c <= 10 &&
-    t >= 1 && t <= 10 &&
-    f >= 1 && f <= 10 &&
-    e >= 1 && e <= 10;
-
-  const pr = haveAllFour ? computePriorityRank(c, t, f, e) : null;
-  const tier = haveAllFour ? tierForPR(pr) : null;
-  const unblock = haveAllFour ? shouldLeaderUnblock(t, e) : false;
-
-  const insertRow = {
-    org_slug: org,
-    user_id,
-    title,
-    transcript,
-    customer_impact: haveAllFour ? c : null,
-    team_energy: haveAllFour ? t : null,
-    frequency: haveAllFour ? f : null,
-    ease: haveAllFour ? e : null,
-    priority_rank: pr,
-    action_tier: tier,
-    leader_to_unblock: unblock,
-  };
-
-  const { data, error } = await supabase.from("items").insert(insertRow).select("*").single();
-  if (error) return res.status(500).json({ error: error.message });
-
-  data.title = fallbackTitle(data);
-  res.json({ ok: true, item: data });
-});
-
-// Update 4 factors
-app.post("/items/:id/factors", async (req, res) => {
-  const id = req.params.id;
-  const { customer_impact, team_energy, frequency, ease } = req.body || {};
-
-  const c = Number(customer_impact);
-  const t = Number(team_energy);
-  const f = Number(frequency);
-  const e = Number(ease);
-
-  for (const [k, v] of Object.entries({ customer_impact: c, team_energy: t, frequency: f, ease: e })) {
-    if (!Number.isFinite(v) || v < 1 || v > 10) {
-      return res.status(400).json({ error: `Invalid ${k}: must be 1..10` });
-    }
+    res.json({ people: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
-
-  const pr = computePriorityRank(c, t, f, e);
-  const tier = tierForPR(pr);
-  const unblock = shouldLeaderUnblock(t, e);
-
-  const { error } = await supabase
-    .from("items")
-    .update({
-      customer_impact: c,
-      team_energy: t,
-      frequency: f,
-      ease: e,
-      priority_rank: pr,
-      action_tier: tier,
-      leader_to_unblock: unblock,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id);
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: unblock });
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`✅ Felma backend running on :${port}`);
+// Items list — returns title even if DB title is null/empty
+app.get("/api/list", async (req, res) => {
+  const org = req.query.org || null;
+  try {
+    const { rows } = await pool.query(
+      `
+      select
+        id,
+        created_at,
+        coalesce(nullif(title,''), left(regexp_replace(btrim(coalesce(transcript,'')), '\\s+', ' ', 'g'), 80), '(untitled)') as title,
+        "user",             -- legacy phone field (text)
+        user_id,            -- future auth link
+        priority_rank,
+        action_tier,
+        leader_to_unblock,
+        customer_impact,
+        team_energy,
+        frequency,
+        ease,
+        org_slug
+      from public.items
+      where ($1::text is null or org_slug = $1)
+      order by priority_rank desc nulls last, created_at desc
+    `,
+      [org]
+    );
+    res.json({ items: rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create new item
+app.post("/items/new", async (req, res) => {
+  try {
+    const org = req.body.org || req.query.org || "stmichaels";
+    const user = normPhone(req.body.user) || null; // phone as text for pilot
+    const rawTitle = (req.body.title || "").trim();
+    const transcript = (req.body.transcript || "").trim();
+    const title = rawTitle || shortTitleFrom(transcript);
+
+    const { rows } = await pool.query(
+      `
+      insert into public.items (title, transcript, "user", org_slug)
+      values ($1, $2, $3, $4)
+      returning id, created_at, title, "user", org_slug
+    `,
+      [title, transcript, user, org]
+    );
+    res.json({ ok: true, item: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Save 4 factors + derived rank/tier/unblock
+app.post("/items/:id/factors", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { customer_impact, team_energy, frequency, ease } = req.body;
+
+    const pr = computePriorityRank(customer_impact, team_energy, frequency, ease);
+    const tier = tierForPR(pr);
+    const unblock = shouldLeaderUnblock(team_energy, ease);
+
+    const { rows } = await pool.query(
+      `
+      update public.items
+      set customer_impact = $2,
+          team_energy     = $3,
+          frequency       = $4,
+          ease            = $5,
+          priority_rank   = $6,
+          action_tier     = $7,
+          leader_to_unblock = $8
+      where id = $1
+      returning id, priority_rank, action_tier, leader_to_unblock,
+                customer_impact, team_energy, frequency, ease
+    `,
+      [id, customer_impact, team_energy, frequency, ease, pr, tier, unblock]
+    );
+    res.json({ ok: true, item: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Update title (pilot-grade: allow originator only by phone match)
+app.post("/items/:id/title", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const requester = normPhone(req.body.user) || "";
+    const title = (req.body.title || "").trim().slice(0, 80) || "(untitled)";
+
+    const { rows: chk } = await pool.query(
+      `select "user" from public.items where id = $1`,
+      [id]
+    );
+    if (!chk.length) return res.status(404).json({ error: "Not found" });
+
+    const origin = normPhone(chk[0].user);
+    if (origin && requester && origin !== requester) {
+      return res.status(403).json({ error: "Only originator can edit title (pilot rule)" });
+    }
+
+    const { rows } = await pool.query(
+      `update public.items set title = $2 where id = $1 returning id, title`,
+      [id, title]
+    );
+    res.json({ ok: true, item: rows[0] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log("felma-backend running on", PORT);
 });
