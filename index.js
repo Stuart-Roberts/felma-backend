@@ -1,199 +1,72 @@
-// Minimal Express + Supabase backend (defensive & UI-friendly)
-
+// Minimal, defensive API for Felma (Supabase HTTP client, no pg socket)
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
 const PORT = process.env.PORT || 10000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const ADMIN_KEY = process.env.ADMIN_KEY;
+const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
-// ---- CORS ----
-const ORIGIN = (process.env.CORS_ORIGIN || "").trim() || "*";
+if (!SUPABASE_URL || !ADMIN_KEY) {
+  console.error("Missing SUPABASE_URL or ADMIN_KEY environment variable.");
+  process.exit(1);
+}
+
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 app.use(
   cors({
-    origin: ORIGIN,
+    origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
+    credentials: false,
   })
 );
 
-// ---- Supabase ----
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY;
-if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error("Missing SUPABASE_URL or ADMIN_KEY env var!");
+function sb() {
+  return createClient(SUPABASE_URL, ADMIN_KEY, {
+    auth: { persistSession: false },
+  });
 }
-const supabase = createClient(SUPABASE_URL, ADMIN_KEY);
 
-const DEF_ORG = (process.env.DEFAULT_ORG || "").trim() || null;
+function safeInt(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
-// ---- helpers ----
-const isUUID = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s || "");
-const looksLikePhone = (s) => typeof s === "string" && s.replace(/[^\d+]/g, "").length >= 10;
-const safeTitle = (t, transcript) => {
+function safeTitle(t, transcript) {
   const s = (t || "").toString().trim();
-  if (s) return s.slice(0, 80);
+  if (s) return s.slice(0, 120);
   const tt = (transcript || "").toString().trim();
-  if (tt) return tt.replace(/\s+/g, " ").slice(0, 80);
-  return "(untitled)";
-};
-const numOrNull = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
-
-async function getOrg(req) {
-  return (req.query.org || DEF_ORG || "").toString().trim();
+  return tt ? tt.slice(0, 120) : "(untitled)";
 }
 
-// find the current user (“me”) by phone/email/id
-async function getMeProfile(org, meRaw) {
-  const me = (meRaw || "").toString().trim();
-  if (!me) return null;
+// ---------- health
+app.get(["/api/health", "/health"], (_req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
-  // try phone
-  if (looksLikePhone(me)) {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, phone, email, full_name, display_name")
-      .eq("org_slug", org)
-      .eq("phone", me)
-      .limit(1)
-      .maybeSingle();
-    if (!error && data) return data;
-  }
-
-  // try email
-  if (me.includes("@")) {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, phone, email, full_name, display_name")
-      .eq("org_slug", org)
-      .eq("email", me)
-      .limit(1)
-      .maybeSingle();
-    if (!error && data) return data;
-  }
-
-  // try exact id
-  if (isUUID(me)) {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, phone, email, full_name, display_name")
-      .eq("org_slug", org)
-      .eq("id", me)
-      .limit(1)
-      .maybeSingle();
-    if (!error && data) return data;
-  }
-
-  return null;
-}
-
-// build a map of profile.id -> display_name and phone->display_name for an org
-async function getProfileMaps(org) {
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("id, phone, display_name")
-    .eq("org_slug", org);
-  const idToName = new Map();
-  const phoneToName = new Map();
-  if (!error && Array.isArray(data)) {
-    data.forEach((p) => {
-      if (p?.id) idToName.set(p.id, p.display_name || null);
-      if (p?.phone) phoneToName.set(p.phone, p.display_name || null);
-    });
-  }
-  return { idToName, phoneToName };
-}
-
-// map DB row -> API item with fallbacks & “is_me”
-function normalizeItem(row, { idToName, phoneToName }, meProfile, meRaw) {
-  const title = safeTitle(row.title, row.transcript);
-  const user_id = row.user_id ?? null;
-
-  let originator_name = row.originator_name ?? null;
-  if (!originator_name && user_id && isUUID(user_id) && idToName.has(user_id)) {
-    originator_name = idToName.get(user_id);
-  }
-  if (!originator_name && looksLikePhone(user_id) && phoneToName.has(user_id)) {
-    originator_name = phoneToName.get(user_id);
-  }
-
-  const meStr = (meRaw || "").toString().trim();
-  const is_me =
-    !!meProfile?.id && user_id && isUUID(user_id) && user_id === meProfile.id
-      ? true
-      : looksLikePhone(meStr) && user_id && looksLikePhone(user_id) && user_id === meStr
-      ? true
-      : false;
-
-  return {
-    id: row.id,
-    created_at: row.created_at,
-    org_slug: row.org_slug || row.org || null,
-    user_id,
-    title,
-    transcript: row.transcript || null,
-    action_tier: row.action_tier ?? null,
-    priority_rank: row.priority_rank ?? null,
-    frequency: row.frequency ?? null,
-    ease: row.ease ?? null,
-    leader_to_unblock: row.leader_to_unblock ?? row.leader_to_unlock ?? null, // tolerate old/new names
-    originator_name: originator_name ?? null,
-    is_me,
-  };
-}
-
-// update helper that retries if a column doesn’t exist (42703)
-async function safeUpdateItem(id, patch) {
-  // map accidental field from UI
-  if ("leader_to_unlock" in patch && !("leader_to_unblock" in patch)) {
-    patch.leader_to_unblock = patch.leader_to_unlock;
-    delete patch.leader_to_unlock;
-  }
-
-  // remove undefineds
-  Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
-
-  let fields = { ...patch };
-  while (true) {
-    if (!Object.keys(fields).length) {
-      return { ok: true, data: null, removed: true }; // nothing left to update
-    }
-    const { data, error } = await supabase.from("items").update(fields).eq("id", id).select("id").maybeSingle();
-    if (!error) return { ok: true, data };
-    if (error.code === "42703") {
-      // find missing column name and drop it, then retry
-      const m = /column\s+(?:\w+\.)?"?([\w_]+)"?\s+does not exist/i.exec(error.message || "");
-      if (m && fields[m[1]] !== undefined) {
-        delete fields[m[1]];
-        continue;
-      }
-    }
-    return { ok: false, error };
-  }
-}
-
-// ---- routes ----
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
-
-// list people (profiles)
-app.get("/api/people", async (req, res) => {
+// ---------- people (profiles)
+app.get(["/api/people", "/people"], async (_req, res) => {
   try {
-    const org = await getOrg(req);
+    const supabase = sb();
+    // Be defensive about column names; prefer "id" and allow "uid"
     const { data, error } = await supabase
       .from("profiles")
-      .select("id, email, phone, full_name, display_name, is_leader, org_slug")
-      .eq("org_slug", org);
+      .select("id, uid, email, phone, full_name, display_name");
 
     if (error) throw error;
 
-    const people = (data || []).map((p) => ({
-      id: p.id,
-      email: p.email || null,
-      phone: p.phone || null,
-      full_name: p.full_name || null,
-      display_name: p.display_name || p.full_name || null,
-      is_leader: !!p.is_leader,
-      org_slug: p.org_slug || org,
-    }));
+    const people =
+      data?.map((r) => ({
+        id: r.id || r.uid || null,
+        uid: r.id || r.uid || null,
+        email: r.email || null,
+        phone: r.phone || null,
+        full_name: r.full_name || null,
+        display_name:
+          r.display_name || r.full_name || r.email || r.phone || "Unknown",
+      })) ?? [];
 
     res.json({ people });
   } catch (err) {
@@ -202,26 +75,56 @@ app.get("/api/people", async (req, res) => {
   }
 });
 
-// list items (ranked by default)
-app.get("/api/list", async (req, res) => {
-  const org = await getOrg(req);
-  const me = (req.query.me || "").toString();
-
+// ---------- list items
+app.get(["/api/list", "/items"], async (req, res) => {
+  const org = (req.query.org || DEFAULT_ORG || "").toString().trim();
   try {
-    // fetch items defensively (select * to avoid missing-column errors)
-    let q = supabase.from("items").select("*").eq("org_slug", org);
+    const supabase = sb();
 
-    // default sort: priority_rank desc NULLS LAST, then created_at desc
-    q = q.order("priority_rank", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false });
+    // Pull a broad set of columns; tolerate if some don’t exist (nulls)
+    const { data, error } = await supabase
+      .from("items")
+      .select(
+        [
+          "id",
+          "created_at",
+          "org_slug",
+          "user_id",
+          "originator_name",
+          "title",
+          "transcript",
+          "action_tier",
+          "priority_rank",
+          "frequency",
+          "ease",
+          "leader_to_unblock", // tolerate missing
+          "team_energy", // tolerate missing
+        ].join(",")
+      )
+      .eq("org_slug", org)
+      .order("priority_rank", { ascending: false, nullsFirst: false })
+      .order("created_at", { ascending: false });
 
-    const [{ data: rows, error }, meProfile, maps] = await Promise.all([
-      q,
-      getMeProfile(org, me),
-      getProfileMaps(org),
-    ]);
     if (error) throw error;
 
-    const items = (rows || []).map((r) => normalizeItem(r, maps, meProfile, me));
+    const items =
+      data?.map((r) => ({
+        id: r.id,
+        created_at: r.created_at,
+        org_slug: r.org_slug,
+        user_id: r.user_id ?? null,
+        originator_name: r.originator_name ?? null,
+        title: safeTitle(r.title, r.transcript),
+        transcript: r.transcript ?? null,
+        action_tier: r.action_tier ?? null,
+        priority_rank: safeInt(r.priority_rank),
+        frequency: safeInt(r.frequency),
+        ease: safeInt(r.ease),
+        leader_to_unblock:
+          r.leader_to_unblock === undefined ? null : r.leader_to_unblock,
+        team_energy: safeInt(r.team_energy),
+      })) ?? [];
+
     res.json({ items });
   } catch (err) {
     console.error("GET /api/list error:", err);
@@ -229,69 +132,156 @@ app.get("/api/list", async (req, res) => {
   }
 });
 
-// create a new item
-app.post("/api/items/new", async (req, res) => {
+// ---------- get factors for one item (UI calls GET /items/:id/factors)
+app.get(["/api/items/:id/factors", "/items/:id/factors"], async (req, res) => {
+  const { id } = req.params;
   try {
-    const org = (req.body.org || req.query.org || DEF_ORG || "").toString().trim();
-    const me = (req.body.me || req.query.me || "").toString().trim();
-    const meProfile = await getMeProfile(org, me);
+    const supabase = sb();
+    const { data, error } = await supabase
+      .from("items")
+      .select("team_energy, frequency, ease, priority_rank")
+      .eq("id", id)
+      .single();
 
-    const transcript = (req.body.transcript || "").toString();
-    const title = safeTitle(req.body.title, transcript);
+    if (error) {
+      // If not found or column missing, return safe defaults
+      console.warn("GET factors fallback:", error.message);
+      return res.json({
+        team_energy: null,
+        frequency: null,
+        ease: null,
+        priority_rank: null,
+      });
+    }
 
-    const insertRow = {
-      title,
-      transcript: transcript || null,
-      org_slug: org,
-      user_id: meProfile?.id || (looksLikePhone(me) ? me : null),
-    };
+    res.json({
+      team_energy:
+        data?.team_energy === undefined ? null : safeInt(data.team_energy),
+      frequency:
+        data?.frequency === undefined ? null : safeInt(data.frequency),
+      ease: data?.ease === undefined ? null : safeInt(data.ease),
+      priority_rank:
+        data?.priority_rank === undefined ? null : safeInt(data.priority_rank),
+    });
+  } catch (err) {
+    console.error("GET /items/:id/factors error:", err);
+    res.status(500).json({ error: "factors_failed" });
+  }
+});
 
-    const { data, error } = await supabase.from("items").insert(insertRow).select("id").single();
+// ---------- update factors (UI saves here)
+app.post(["/api/items/:id/factors", "/items/:id/factors"], async (req, res) => {
+  const { id } = req.params;
+  // Accept any shape, coerce to ints
+  const team_energy = safeInt(req.body?.team_energy);
+  const frequency = safeInt(req.body?.frequency);
+  const ease = safeInt(req.body?.ease);
+  const priority_rank = safeInt(req.body?.priority_rank);
+
+  const payload = {};
+  if (team_energy !== null) payload.team_energy = team_energy;
+  if (frequency !== null) payload.frequency = frequency;
+  if (ease !== null) payload.ease = ease;
+  if (priority_rank !== null) payload.priority_rank = priority_rank;
+
+  try {
+    if (!Object.keys(payload).length) {
+      return res.json({ ok: true, updated: 0 });
+    }
+
+    const supabase = sb();
+    const { error } = await supabase.from("items").update(payload).eq("id", id);
     if (error) throw error;
 
-    res.json({ ok: true, id: data.id });
+    res.json({ ok: true, updated: 1 });
   } catch (err) {
-    console.error("POST /api/items/new error:", err);
+    console.error("POST /items/:id/factors error:", err);
+    res.status(500).json({ error: "save_factors_failed" });
+  }
+});
+
+// ---------- create new item (UI posts to /items/new)
+app.post(["/api/items/new", "/items/new"], async (req, res) => {
+  try {
+    const supabase = sb();
+
+    const org =
+      (req.query.org ||
+        req.body?.org ||
+        req.body?.org_slug ||
+        DEFAULT_ORG) + "";
+    const title = safeTitle(req.body?.title, req.body?.transcript);
+    const transcript = (req.body?.transcript || "").toString().trim() || null;
+
+    // Optional metadata from UI
+    const originator_name =
+      (req.body?.originator_name || req.body?.user_name || "").trim() || null;
+    const user_id =
+      (req.body?.user_id || req.body?.phone || req.body?.uid || "").trim() ||
+      null;
+
+    const team_energy = safeInt(req.body?.team_energy);
+    const frequency = safeInt(req.body?.frequency);
+    const ease = safeInt(req.body?.ease);
+    const priority_rank = safeInt(req.body?.priority_rank);
+
+    const row = {
+      org_slug: org,
+      title,
+      transcript,
+      originator_name,
+      user_id,
+      team_energy,
+      frequency,
+      ease,
+      priority_rank,
+    };
+
+    // Remove undefined keys
+    Object.keys(row).forEach((k) => row[k] === undefined && delete row[k]);
+
+    const { data, error } = await supabase
+      .from("items")
+      .insert(row)
+      .select("id")
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({ ok: true, id: data?.id });
+  } catch (err) {
+    console.error("POST /items/new error:", err);
     res.status(500).json({ error: "add_failed" });
   }
 });
 
-// update factors / generic update (aliases to catch unknown UI routes)
-async function handleUpdate(req, res, idFromPath) {
+// ---------- update basic fields (title/transcript) if UI sends it
+app.put(["/api/items/:id", "/items/:id"], async (req, res) => {
+  const { id } = req.params;
   try {
-    const id = (idFromPath || req.body.id || req.query.id || "").toString();
-    if (!isUUID(id)) return res.status(400).json({ error: "bad_id" });
+    const payload = {};
+    if (typeof req.body?.title === "string")
+      payload.title = safeTitle(req.body.title, req.body.transcript);
+    if (typeof req.body?.transcript === "string")
+      payload.transcript = req.body.transcript;
 
-    const patch = {
-      // tolerate either name; we’ll remap in safeUpdateItem
-      leader_to_unlock: req.body.leader_to_unlock,
-      leader_to_unblock: req.body.leader_to_unblock,
-      action_tier: req.body.action_tier,
-      priority_rank: numOrNull(req.body.priority_rank),
-      frequency: numOrNull(req.body.frequency),
-      ease: numOrNull(req.body.ease),
-      title: req.body.title,
-      transcript: req.body.transcript,
-    };
-
-    const result = await safeUpdateItem(id, patch);
-    if (!result.ok) {
-      console.error("Update failed:", result.error);
-      return res.status(500).json({ error: "save_failed" });
+    if (!Object.keys(payload).length) {
+      return res.json({ ok: true, updated: 0 });
     }
-    res.json({ ok: true, id });
-  } catch (err) {
-    console.error("POST update error:", err);
-    res.status(500).json({ error: "save_failed" });
-  }
-}
 
-// common aliases so your UI won’t 404
-app.post("/api/items/save", (req, res) => handleUpdate(req, res, null));
-app.post("/api/items/update", (req, res) => handleUpdate(req, res, null));
-app.post("/api/save", (req, res) => handleUpdate(req, res, null));
-app.post("/api/items/:id", (req, res) => handleUpdate(req, res, req.params.id));
-app.post("/api/items/:id/factors", (req, res) => handleUpdate(req, res, req.params.id));
+    const supabase = sb();
+    const { error } = await supabase.from("items").update(payload).eq("id", id);
+    if (error) throw error;
+
+    res.json({ ok: true, updated: 1 });
+  } catch (err) {
+    console.error("PUT /items/:id error:", err);
+    res.status(500).json({ error: "update_failed" });
+  }
+});
+
+// ---------- fallback
+app.use((_req, res) => res.status(404).send("Not found"));
 
 app.listen(PORT, () => {
   console.log(`felma-backend running on ${PORT}`);
