@@ -1,121 +1,86 @@
-// Minimal, robust Express backend for Render + Supabase (postgres)
+// CommonJS backend for Render + Supabase (HTTP client only)
+// Minimal, safe CORS and robust list/people/factors routes.
+
 const express = require("express");
 const cors = require("cors");
-const { Pool } = require("pg");
+const { createClient } = require("@supabase/supabase-js");
 
-// ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 
-// Required envs
-const DATABASE_URL = process.env.DATABASE_URL; // Supabase > Project Settings > Database > Connection string (Node.js)
-if (!DATABASE_URL) {
-  console.error("❌ Missing DATABASE_URL env var.");
-  process.exit(1);
-}
-
-// Optional envs
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-const DEFAULT_ORG = (process.env.DEFAULT_ORG || "").trim() || null;
-
-// Force IPv4 preference if Render resolves IPv6 first
-// (You can also set NODE_OPTIONS=--dns-result-order=ipv4first in Render)
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // accept Supabase SSL
-
-// ---------- App ----------
+// ---- CORS ---------------------------------------------------------------
+const ALLOW_ORIGIN = process.env.CORS_ORIGIN || "*";
+// IMPORTANT: if you set a specific origin, do NOT comma-separate values.
+const corsOptions = {
+  origin: ALLOW_ORIGIN,
+  credentials: false, // leave false when origin="*"
+};
 const app = express();
+app.use(cors(corsOptions));
 app.use(express.json());
 
-// CORS (single origin string)
-app.use(
-  cors({
-    origin: CORS_ORIGIN,
-    credentials: false,
-  })
-);
-
-// ---------- Database ----------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  // With Supabase pgBouncer connection string this is fine.
-});
-
-// Utility: safe title fallback from transcript if title missing/empty
-function makeSafeTitle(title, transcript) {
-  const base = (title || "").trim();
-  if (base) return base.slice(0, 80);
-  const t = (transcript || "").trim();
-  if (!t) return "(untitled)";
-  // Take the first sentence or up to 80 chars
-  let s = t.replace(/\s+/g, " ").replace(/^[-–•]+/, "").trim();
-  return s.slice(0, 80);
+// ---- Supabase (HTTP client) ---------------------------------------------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const ADMIN_KEY = process.env.ADMIN_KEY; // service_role key
+if (!SUPABASE_URL || !ADMIN_KEY) {
+  console.error("Missing SUPABASE_URL or ADMIN_KEY env var.");
 }
 
-// ---------- Routes ----------
-
-app.get("/api/health", async (_req, res) => {
-  try {
-    const r = await pool.query("select 1;");
-    res.json({ ok: true, db: r.rows[0]["?column?" ] || 1 });
-  } catch (err) {
-    console.error("health error:", err);
-    res.status(500).json({ ok: false, error: "db_unreachable" });
-  }
+const sb = createClient(SUPABASE_URL, ADMIN_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+  global: { headers: { "x-app": "felma-backend" } },
 });
 
-// List items for org (defaults to DEFAULT_ORG if provided)
-app.get("/api/list", async (req, res) => {
-  const org = (req.query.org || DEFAULT_ORG || "").trim();
-  const where = org ? "where coalesce(org_slug,'') = $1" : "";
-  const params = org ? [org] : [];
+// ---- Helpers -------------------------------------------------------------
+const safeTitle = (row) => {
+  const t = (row?.title || "").trim();
+  if (t) return t;
+  const fromTranscript = (row?.transcript || "").trim().replace(/\s+/g, " ");
+  if (fromTranscript) return fromTranscript.slice(0, 80);
+  return "(untitled)";
+};
 
-  const sql = `
-    select
-      id, created_at, user_id, title, transcript,
-      phone, originator_name,
-      priority_rank, action_tier, leader_to_unblock,
-      customer_impact, team_energy, frequency, ease,
-      coalesce(org_slug,'') as org_slug
-    from public.items
-    ${where}
-    order by coalesce(priority_rank, 0) desc, created_at desc
-    limit 500;
-  `;
+const toCard = (row) => ({
+  id: row.id,
+  created_at: row.created_at,
+  title: safeTitle(row),
+  transcript: row.transcript || null,
+  originator_name: row.originator_name || null,
+  phone: row.phone || null,
+  org_slug: row.org_slug || null,
 
-  try {
-    const { rows } = await pool.query(sql, params);
-    const items = rows.map(r => ({
-      ...r,
-      // ensure title is always present
-      title: makeSafeTitle(r.title, r.transcript),
-    }));
-    res.json({ items });
-  } catch (err) {
-    console.error("GET /api/list error:", err);
-    res.status(500).json({ error: "list_failed" });
-  }
+  // ranking fields (nullable)
+  priority_rank: row.priority_rank ?? null,
+  action_tier: row.action_tier ?? null,
+  leader_to_unblock: row.leader_to_unblock ?? false,
+  customer_impact: row.customer_impact ?? null,
+  team_energy: row.team_energy ?? null,
+  frequency: row.frequency ?? null,
+  ease: row.ease ?? null,
 });
 
-// People directory for pills, names, leader flag
-app.get("/api/people", async (_req, res) => {
-  const sql = `
-    select id, email, phone, full_name, display_name,
-           coalesce(is_leader, false) as is_leader,
-           coalesce(org_slug,'') as org_slug
-    from public.profiles
-    order by display_name nulls last, full_name nulls last;
-  `;
+// ---- Routes --------------------------------------------------------------
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, org: process.env.DEFAULT_ORG || null });
+});
+
+app.get("/api/people", async (req, res) => {
   try {
-    const { rows } = await pool.query(sql);
-    const people = rows.map(p => ({
+    // profiles table: id, email, phone, full_name, display_name
+    const { data, error } = await sb
+      .from("profiles")
+      .select("id, email, phone, full_name, display_name")
+      .order("full_name", { ascending: true });
+
+    if (error) throw error;
+
+    const people = (data || []).map((p) => ({
       id: p.id,
-      email: p.email,
-      phone: p.phone || "",
-      full_name: p.full_name || "",
-      display_name: p.display_name || p.full_name || "",
-      is_leader: !!p.is_leader,
-      org_slug: p.org_slug || "",
+      email: p.email || null,
+      phone: p.phone || null,
+      full_name: p.full_name || null,
+      display_name: p.display_name || p.full_name || null,
     }));
+
     res.json({ people });
   } catch (err) {
     console.error("GET /api/people error:", err);
@@ -123,98 +88,116 @@ app.get("/api/people", async (_req, res) => {
   }
 });
 
-// Create new item
+app.get("/api/list", async (req, res) => {
+  try {
+    const org = (req.query.org || process.env.DEFAULT_ORG || "").trim() || null;
+
+    let q = sb
+      .from("items")
+      .select(
+        [
+          "id",
+          "created_at",
+          "user_id",
+          "title",
+          "transcript",
+          "phone",
+          "originator_name",
+          "priority_rank",
+          "action_tier",
+          "leader_to_unblock",
+          "customer_impact",
+          "team_energy",
+          "frequency",
+          "ease",
+          "org_slug",
+        ].join(",")
+      )
+      .order("created_at", { ascending: false });
+
+    if (org) q = q.eq("org_slug", org);
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const items = (data || []).map(toCard);
+    res.json({ items });
+  } catch (err) {
+    console.error("GET /api/list error:", err);
+    res.status(500).json({ error: "list_failed" });
+  }
+});
+
+// Create a new item (title optional; will fall back to transcript)
 app.post("/items/new", async (req, res) => {
   try {
-    const {
+    const body = req.body || {};
+    const org_slug = (body.org || process.env.DEFAULT_ORG || "").trim() || null;
+
+    const row = {
       org_slug,
-      user_id,
-      phone,
-      originator_name,
-      title,
-      transcript,
-    } = req.body || {};
+      user_id: body.user_id || null,
+      originator_name: body.originator_name || null,
+      phone: body.phone || null,
+      transcript: body.transcript || null,
+      title: (body.title || "").trim() || null,
+      priority_rank: null,
+      action_tier: null,
+      leader_to_unblock: false,
+      customer_impact: null,
+      team_energy: null,
+      frequency: null,
+      ease: null,
+    };
 
-    const safetitle = makeSafeTitle(title, transcript);
+    const { data, error } = await sb.from("items").insert(row).select().single();
+    if (error) throw error;
 
-    const sql = `
-      insert into public.items
-        (org_slug, user_id, phone, originator_name, title, transcript)
-      values ($1, $2, $3, $4, $5, $6)
-      returning id, created_at;
-    `;
-    const { rows } = await pool.query(sql, [
-      (org_slug || DEFAULT_ORG || "").trim(),
-      user_id || null,
-      phone || null,
-      originator_name || null,
-      safetitle,
-      transcript || null,
-    ]);
-
-    res.json({ ok: true, id: rows[0].id, created_at: rows[0].created_at });
+    res.json({ ok: true, item: toCard(data) });
   } catch (err) {
     console.error("POST /items/new error:", err);
     res.status(500).json({ error: "new_failed" });
   }
 });
 
-// Update rating factors + tier/leader flags
+// Save factors + optional computed rank
 app.post("/items/:id/factors", async (req, res) => {
   try {
     const id = req.params.id;
-    const {
-      customer_impact,
-      team_energy,
-      frequency,
-      ease,
-      action_tier,
-      leader_to_unblock,
-      priority_rank, // optional precomputed
-    } = req.body || {};
+    const { customer_impact, team_energy, frequency, ease, leader_to_unblock, action_tier } =
+      req.body || {};
 
-    // If rank not provided, recompute a simple ICE-like score
-    const rank =
-      typeof priority_rank === "number" && !isNaN(priority_rank)
-        ? priority_rank
-        : (Number(customer_impact || 0) +
-           Number(team_energy || 0) +
-           Number(frequency || 0) +
-           Number(ease || 0));
+    const ci = Number(customer_impact) || null;
+    const te = Number(team_energy) || null;
+    const fr = Number(frequency) || null;
+    const es = Number(ease) || null;
 
-    const sql = `
-      update public.items
-      set customer_impact = $1,
-          team_energy = $2,
-          frequency = $3,
-          ease = $4,
-          action_tier = $5,
-          leader_to_unblock = $6,
-          priority_rank = $7
-      where id = $8
-      returning id;
-    `;
+    let priority_rank = null;
+    if ([ci, te, fr, es].every((v) => v !== null)) {
+      // simple rank calc; replace with your exact formula if you have one
+      priority_rank = ci + te + fr + es;
+    }
 
-    const { rows } = await pool.query(sql, [
-      customer_impact ?? null,
-      team_energy ?? null,
-      frequency ?? null,
-      ease ?? null,
-      action_tier ?? null,
-      !!leader_to_unblock,
-      rank,
-      id,
-    ]);
+    const updates = {
+      customer_impact: ci,
+      team_energy: te,
+      frequency: fr,
+      ease: es,
+      leader_to_unblock: !!leader_to_unblock,
+      action_tier: action_tier ?? null,
+      priority_rank,
+    };
 
-    if (!rows.length) return res.status(404).json({ error: "not_found" });
-    res.json({ ok: true, id });
+    const { data, error } = await sb.from("items").update(updates).eq("id", id).select().single();
+    if (error) throw error;
+
+    res.json({ ok: true, item: toCard(data) });
   } catch (err) {
     console.error("POST /items/:id/factors error:", err);
     res.status(500).json({ error: "factors_failed" });
   }
 });
 
-// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`✅ felma-backend running on ${PORT}`);
+  console.log(`felma-backend running on ${PORT}`);
 });
