@@ -2,13 +2,13 @@
   "name": "felma-backend",
   "version": "1.0.0",
   "private": true,
-  "main": "index.js",
+  "license": "UNLICENSED",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
+    "@supabase/supabase-js": "^2.46.4",
     "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.18.2"
   }
 }
