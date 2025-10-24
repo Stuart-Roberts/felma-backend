@@ -1,122 +1,121 @@
-// Minimal Express + Postgres (via Supabase pg-relay)
-// CommonJS, safe CORS, and clear errors.
-
+// Minimal, robust Express backend for Render + Supabase (postgres)
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 
-const app = express();
+// ---------- Config ----------
 const PORT = process.env.PORT || 10000;
 
-// ---------- CORS ----------
-const ORIGIN = process.env.CORS_ORIGIN || "*";
-// single value only; cors() accepts string or function
-app.use(cors({ origin: ORIGIN }));
+// Required envs
+const DATABASE_URL = process.env.DATABASE_URL; // Supabase > Project Settings > Database > Connection string (Node.js)
+if (!DATABASE_URL) {
+  console.error("❌ Missing DATABASE_URL env var.");
+  process.exit(1);
+}
+
+// Optional envs
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const DEFAULT_ORG = (process.env.DEFAULT_ORG || "").trim() || null;
+
+// Force IPv4 preference if Render resolves IPv6 first
+// (You can also set NODE_OPTIONS=--dns-result-order=ipv4first in Render)
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"; // accept Supabase SSL
+
+// ---------- App ----------
+const app = express();
 app.use(express.json());
 
-// ---------- DB (Postgres via Supabase pg-relay) ----------
-const DATABASE_URL = process.env.DATABASE_URL;
-if (!DATABASE_URL) {
-  console.error("Missing DATABASE_URL env var");
-  // Keep server up so /api/health still works
-}
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL, // use Supabase "Connection string → Node.js"
-      ssl: { rejectUnauthorized: false }, // required on Render
-    })
-  : null;
+// CORS (single origin string)
+app.use(
+  cors({
+    origin: CORS_ORIGIN,
+    credentials: false,
+  })
+);
 
-// ---------- Helpers ----------
-function makeSafeTitle(row) {
-  // Prefer explicit title; otherwise derive from transcript and trim
-  const t = (row.title || "").trim();
-  if (t) return t;
-  const fromTranscript = (row.transcript || "").trim();
-  const clean = fromTranscript.replace(/\s+/g, " ");
-  return clean ? clean.slice(0, 80) : "(untitled)";
-}
+// ---------- Database ----------
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  // With Supabase pgBouncer connection string this is fine.
+});
 
-function tidy(row) {
-  return {
-    id: row.id,
-    created_at: row.created_at,
-    user_id: row.user_id,
-    title: makeSafeTitle(row),
-    transcript: row.transcript || null,
-    originator_name: row.originator_name || null,
-    action_tier: row.action_tier || null,
-    leader_to_unblock: row.leader_to_unblock === true,
-    customer_impact: row.customer_impact ?? null,
-    team_energy: row.team_energy ?? null,
-    frequency: row.frequency ?? null,
-    ease: row.ease ?? null,
-    priority_rank: row.priority_rank ?? null,
-    org_slug: row.org_slug || null,
-  };
+// Utility: safe title fallback from transcript if title missing/empty
+function makeSafeTitle(title, transcript) {
+  const base = (title || "").trim();
+  if (base) return base.slice(0, 80);
+  const t = (transcript || "").trim();
+  if (!t) return "(untitled)";
+  // Take the first sentence or up to 80 chars
+  let s = t.replace(/\s+/g, " ").replace(/^[-–•]+/, "").trim();
+  return s.slice(0, 80);
 }
 
 // ---------- Routes ----------
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true });
+
+app.get("/api/health", async (_req, res) => {
+  try {
+    const r = await pool.query("select 1;");
+    res.json({ ok: true, db: r.rows[0]["?column?" ] || 1 });
+  } catch (err) {
+    console.error("health error:", err);
+    res.status(500).json({ ok: false, error: "db_unreachable" });
+  }
 });
 
+// List items for org (defaults to DEFAULT_ORG if provided)
 app.get("/api/list", async (req, res) => {
+  const org = (req.query.org || DEFAULT_ORG || "").trim();
+  const where = org ? "where coalesce(org_slug,'') = $1" : "";
+  const params = org ? [org] : [];
+
+  const sql = `
+    select
+      id, created_at, user_id, title, transcript,
+      phone, originator_name,
+      priority_rank, action_tier, leader_to_unblock,
+      customer_impact, team_energy, frequency, ease,
+      coalesce(org_slug,'') as org_slug
+    from public.items
+    ${where}
+    order by coalesce(priority_rank, 0) desc, created_at desc
+    limit 500;
+  `;
+
   try {
-    if (!pool) throw new Error("no_db_pool");
-
-    // org: query param overrides DEFAULT_ORG; empty string treated as null
-    const envOrg = (process.env.DEFAULT_ORG || "").trim() || null;
-    const org = (req.query.org || "").trim() || envOrg;
-
-    const where =
-      org === null
-        ? "" // no org filter
-        : "where coalesce(org_slug, $1) = $1";
-
-    const params = org === null ? [] : [org];
-
-    const sql = `
-      select
-        id, created_at, user_id, title, transcript,
-        originator_name, action_tier, leader_to_unblock,
-        customer_impact, team_energy, frequency, ease,
-        priority_rank, org_slug
-      from public.items
-      ${where}
-      order by coalesce(priority_rank, 0) desc, created_at desc
-      limit 500;
-    `;
-
     const { rows } = await pool.query(sql, params);
-    res.json({ items: rows.map(tidy) });
+    const items = rows.map(r => ({
+      ...r,
+      // ensure title is always present
+      title: makeSafeTitle(r.title, r.transcript),
+    }));
+    res.json({ items });
   } catch (err) {
     console.error("GET /api/list error:", err);
     res.status(500).json({ error: "list_failed" });
   }
 });
 
+// People directory for pills, names, leader flag
 app.get("/api/people", async (_req, res) => {
+  const sql = `
+    select id, email, phone, full_name, display_name,
+           coalesce(is_leader, false) as is_leader,
+           coalesce(org_slug,'') as org_slug
+    from public.profiles
+    order by display_name nulls last, full_name nulls last;
+  `;
   try {
-    if (!pool) throw new Error("no_db_pool");
-
-    const sql = `
-      select id, display_name, full_name, is_leader, org_slug, email, phone
-      from public.profiles
-      order by coalesce(display_name, full_name) asc;
-    `;
     const { rows } = await pool.query(sql);
-
-    const people = rows.map((p) => ({
+    const people = rows.map(p => ({
       id: p.id,
-      display_name: p.display_name || p.full_name || p.email || "Unknown",
-      full_name: p.full_name || null,
-      email: p.email || null,
-      phone: p.phone || null,
-      is_leader: p.is_leader === true,
-      org_slug: p.org_slug || null,
+      email: p.email,
+      phone: p.phone || "",
+      full_name: p.full_name || "",
+      display_name: p.display_name || p.full_name || "",
+      is_leader: !!p.is_leader,
+      org_slug: p.org_slug || "",
     }));
-
     res.json({ people });
   } catch (err) {
     console.error("GET /api/people error:", err);
@@ -124,40 +123,45 @@ app.get("/api/people", async (_req, res) => {
   }
 });
 
+// Create new item
 app.post("/items/new", async (req, res) => {
   try {
-    if (!pool) throw new Error("no_db_pool");
-
     const {
-      user_id,
       org_slug,
+      user_id,
+      phone,
       originator_name,
-      transcript,
       title,
+      transcript,
     } = req.body || {};
 
-    const safeTitle = makeSafeTitle({ title, transcript });
+    const safetitle = makeSafeTitle(title, transcript);
 
     const sql = `
       insert into public.items
-        (created_at, user_id, org_slug, originator_name, transcript, title)
-      values (now(), $1, $2, $3, $4, $5)
-      returning id;
+        (org_slug, user_id, phone, originator_name, title, transcript)
+      values ($1, $2, $3, $4, $5, $6)
+      returning id, created_at;
     `;
-    const params = [user_id || null, org_slug || null, originator_name || null, transcript || null, safeTitle];
+    const { rows } = await pool.query(sql, [
+      (org_slug || DEFAULT_ORG || "").trim(),
+      user_id || null,
+      phone || null,
+      originator_name || null,
+      safetitle,
+      transcript || null,
+    ]);
 
-    const { rows } = await pool.query(sql, params);
-    res.json({ ok: true, id: rows[0]?.id || null });
+    res.json({ ok: true, id: rows[0].id, created_at: rows[0].created_at });
   } catch (err) {
     console.error("POST /items/new error:", err);
     res.status(500).json({ error: "new_failed" });
   }
 });
 
+// Update rating factors + tier/leader flags
 app.post("/items/:id/factors", async (req, res) => {
   try {
-    if (!pool) throw new Error("no_db_pool");
-
     const id = req.params.id;
     const {
       customer_impact,
@@ -166,43 +170,51 @@ app.post("/items/:id/factors", async (req, res) => {
       ease,
       action_tier,
       leader_to_unblock,
+      priority_rank, // optional precomputed
     } = req.body || {};
+
+    // If rank not provided, recompute a simple ICE-like score
+    const rank =
+      typeof priority_rank === "number" && !isNaN(priority_rank)
+        ? priority_rank
+        : (Number(customer_impact || 0) +
+           Number(team_energy || 0) +
+           Number(frequency || 0) +
+           Number(ease || 0));
 
     const sql = `
       update public.items
-      set
-        customer_impact = $1,
-        team_energy     = $2,
-        frequency       = $3,
-        ease            = $4,
-        action_tier     = $5,
-        leader_to_unblock = $6,
-        priority_rank   = case
-          when $1 is null or $2 is null or $3 is null or $4 is null then null
-          else ($1 * $3 * 1.0) + ($2 * 0.5) + ($4 * 0.5)
-        end
-      where id = $7
-      returning id, priority_rank;
+      set customer_impact = $1,
+          team_energy = $2,
+          frequency = $3,
+          ease = $4,
+          action_tier = $5,
+          leader_to_unblock = $6,
+          priority_rank = $7
+      where id = $8
+      returning id;
     `;
-    const params = [
+
+    const { rows } = await pool.query(sql, [
       customer_impact ?? null,
       team_energy ?? null,
       frequency ?? null,
       ease ?? null,
       action_tier ?? null,
-      leader_to_unblock === true,
+      !!leader_to_unblock,
+      rank,
       id,
-    ];
+    ]);
 
-    const { rows } = await pool.query(sql, params);
-    res.json({ ok: true, id: rows[0]?.id || id, priority_rank: rows[0]?.priority_rank ?? null });
+    if (!rows.length) return res.status(404).json({ error: "not_found" });
+    res.json({ ok: true, id });
   } catch (err) {
     console.error("POST /items/:id/factors error:", err);
     res.status(500).json({ error: "factors_failed" });
   }
 });
 
-// ---------- Boot ----------
+// ---------- Start ----------
 app.listen(PORT, () => {
-  console.log(`felma-backend running on ${PORT}`);
+  console.log(`✅ felma-backend running on ${PORT}`);
 });
