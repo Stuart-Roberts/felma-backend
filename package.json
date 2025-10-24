@@ -2,7 +2,7 @@
   "name": "felma-backend",
   "version": "0.1.0",
   "private": true,
-  "license": "MIT",
+  "license": "UNLICENSED",
   "scripts": {
     "start": "node index.js"
   },
