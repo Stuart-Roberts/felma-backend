@@ -1,19 +1,21 @@
-// Minimal, defensive API for Felma (Supabase HTTP client, no pg socket)
+// index.js
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
-const PORT = process.env.PORT || 10000;
+// ---- ENV ----
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const ADMIN_KEY = process.env.ADMIN_KEY;
-const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
 
 if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error("Missing SUPABASE_URL or ADMIN_KEY environment variable.");
-  process.exit(1);
+  console.error("Missing SUPABASE_URL or ADMIN_KEY env vars.");
 }
 
+const supabase = createClient(SUPABASE_URL, ADMIN_KEY);
+
+// ---- APP ----
 const app = express();
 app.use(express.json());
 app.use(
@@ -23,266 +25,203 @@ app.use(
   })
 );
 
-function sb() {
-  return createClient(SUPABASE_URL, ADMIN_KEY, {
-    auth: { persistSession: false },
-  });
-}
+// Small helper to normalize null/undefined/empty strings
+const clean = (v) => (typeof v === "string" ? v.trim() : v ?? null);
 
-function safeInt(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function safeTitle(t, transcript) {
-  const s = (t || "").toString().trim();
-  if (s) return s.slice(0, 120);
-  const tt = (transcript || "").toString().trim();
-  return tt ? tt.slice(0, 120) : "(untitled)";
-}
-
-// ---------- health
-app.get(["/api/health", "/health"], (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+// ---- HEALTH ----
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ---------- people (profiles)
-app.get(["/api/people", "/people"], async (_req, res) => {
+// ---- PEOPLE (robust to different column names) ----
+app.get("/api/people", async (_req, res) => {
   try {
-    const supabase = sb();
-    // Be defensive about column names; prefer "id" and allow "uid"
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, uid, email, phone, full_name, display_name");
+    // Try common layouts in order, fall back gracefully
+    const attempts = [
+      "id,email,phone,full_name,display_name",
+      "uuid,email,phone,full_name,display_name",
+      "uid,email,phone,full_name,display_name",
+    ];
 
-    if (error) throw error;
+    let rows = null;
+    let lastErr = null;
 
-    const people =
-      data?.map((r) => ({
-        id: r.id || r.uid || null,
-        uid: r.id || r.uid || null,
-        email: r.email || null,
-        phone: r.phone || null,
-        full_name: r.full_name || null,
-        display_name:
-          r.display_name || r.full_name || r.email || r.phone || "Unknown",
-      })) ?? [];
+    for (const cols of attempts) {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select(cols)
+        .order("full_name", { ascending: true, nullsFirst: true });
 
-    res.json({ people });
-  } catch (err) {
-    console.error("GET /api/people error:", err);
-    res.status(500).json({ error: "people_failed" });
+      if (!error) {
+        rows = data;
+        break;
+      }
+      // 42703 = undefined_column; try next mapping
+      if (error.code !== "42703") {
+        lastErr = error;
+        break;
+      }
+      lastErr = error;
+    }
+
+    if (!rows) throw lastErr || new Error("profiles query failed");
+
+    const people = rows.map((r) => ({
+      id: r.id || r.uuid || r.uid || null,
+      email: clean(r.email),
+      phone: clean(r.phone),
+      full_name: clean(r.full_name),
+      display_name: clean(r.display_name),
+    }));
+
+    return res.json(people);
+  } catch (e) {
+    console.error("GET /api/people error:", e);
+    return res.status(500).json({ error: "people_failed" });
   }
 });
 
-// ---------- list items
-app.get(["/api/list", "/items"], async (req, res) => {
-  const org = (req.query.org || DEFAULT_ORG || "").toString().trim();
-  try {
-    const supabase = sb();
+// ---- LIST ITEMS (keeps { items: [...] } shape) ----
+app.get("/api/list", async (req, res) => {
+  const org = clean(req.query.org) || DEFAULT_ORG;
 
-    // Pull a broad set of columns; tolerate if some don’t exist (nulls)
+  try {
+    // Select only columns we need; all are nullable-safe.
+    const fields = [
+      "id",
+      "created_at",
+      "org_slug",
+      "user_id",
+      "originator_name",
+      "title",
+      "transcript",
+      "action_tier",
+      "priority_rank",
+      "frequency",
+      "ease",
+      "leader_to_unblock",
+      "team_energy",
+    ].join(",");
+
     const { data, error } = await supabase
       .from("items")
-      .select(
-        [
-          "id",
-          "created_at",
-          "org_slug",
-          "user_id",
-          "originator_name",
-          "title",
-          "transcript",
-          "action_tier",
-          "priority_rank",
-          "frequency",
-          "ease",
-          "leader_to_unblock", // tolerate missing
-          "team_energy", // tolerate missing
-        ].join(",")
-      )
+      .select(fields)
       .eq("org_slug", org)
-      .order("priority_rank", { ascending: false, nullsFirst: false })
+      .order("priority_rank", { ascending: false, nullsLast: true })
       .order("created_at", { ascending: false });
 
     if (error) throw error;
 
-    const items =
-      data?.map((r) => ({
-        id: r.id,
-        created_at: r.created_at,
-        org_slug: r.org_slug,
-        user_id: r.user_id ?? null,
-        originator_name: r.originator_name ?? null,
-        title: safeTitle(r.title, r.transcript),
-        transcript: r.transcript ?? null,
-        action_tier: r.action_tier ?? null,
-        priority_rank: safeInt(r.priority_rank),
-        frequency: safeInt(r.frequency),
-        ease: safeInt(r.ease),
-        leader_to_unblock:
-          r.leader_to_unblock === undefined ? null : r.leader_to_unblock,
-        team_energy: safeInt(r.team_energy),
-      })) ?? [];
+    const items = (data || []).map((r) => ({
+      id: r.id,
+      created_at: r.created_at,
+      org_slug: r.org_slug,
+      user_id: clean(r.user_id),
+      originator_name: clean(r.originator_name),
+      // never blank; UI depends on having something
+      title:
+        (r.title && String(r.title).trim()) ||
+        (r.transcript && String(r.transcript).trim()) ||
+        "(untitled)",
+      transcript: clean(r.transcript),
+      action_tier: r.action_tier ?? null,
+      priority_rank: Number.isFinite(r.priority_rank)
+        ? r.priority_rank
+        : null,
+      frequency: Number.isFinite(r.frequency) ? r.frequency : null,
+      ease: Number.isFinite(r.ease) ? r.ease : null,
+      leader_to_unblock:
+        typeof r.leader_to_unblock === "boolean"
+          ? r.leader_to_unblock
+          : false,
+      team_energy: Number.isFinite(r.team_energy) ? r.team_energy : null,
+    }));
 
-    res.json({ items });
-  } catch (err) {
-    console.error("GET /api/list error:", err);
-    res.status(500).json({ error: "list_failed" });
+    return res.json({ items });
+  } catch (e) {
+    console.error("GET /api/list error:", e);
+    return res.status(500).json({ error: "list_failed" });
   }
 });
 
-// ---------- get factors for one item (UI calls GET /items/:id/factors)
-app.get(["/api/items/:id/factors", "/items/:id/factors"], async (req, res) => {
-  const { id } = req.params;
+// ---- UI WRITE ENDPOINTS (no /api prefix because the UI calls root paths) ----
+// Create a new item
+app.post("/items/new", async (req, res) => {
   try {
-    const supabase = sb();
-    const { data, error } = await supabase
-      .from("items")
-      .select("team_energy, frequency, ease, priority_rank")
-      .eq("id", id)
-      .single();
+    const org = clean(req.query.org) || DEFAULT_ORG;
+    const body = req.body || {};
 
-    if (error) {
-      // If not found or column missing, return safe defaults
-      console.warn("GET factors fallback:", error.message);
-      return res.json({
-        team_energy: null,
-        frequency: null,
-        ease: null,
-        priority_rank: null,
-      });
-    }
-
-    res.json({
-      team_energy:
-        data?.team_energy === undefined ? null : safeInt(data.team_energy),
-      frequency:
-        data?.frequency === undefined ? null : safeInt(data.frequency),
-      ease: data?.ease === undefined ? null : safeInt(data.ease),
-      priority_rank:
-        data?.priority_rank === undefined ? null : safeInt(data.priority_rank),
-    });
-  } catch (err) {
-    console.error("GET /items/:id/factors error:", err);
-    res.status(500).json({ error: "factors_failed" });
-  }
-});
-
-// ---------- update factors (UI saves here)
-app.post(["/api/items/:id/factors", "/items/:id/factors"], async (req, res) => {
-  const { id } = req.params;
-  // Accept any shape, coerce to ints
-  const team_energy = safeInt(req.body?.team_energy);
-  const frequency = safeInt(req.body?.frequency);
-  const ease = safeInt(req.body?.ease);
-  const priority_rank = safeInt(req.body?.priority_rank);
-
-  const payload = {};
-  if (team_energy !== null) payload.team_energy = team_energy;
-  if (frequency !== null) payload.frequency = frequency;
-  if (ease !== null) payload.ease = ease;
-  if (priority_rank !== null) payload.priority_rank = priority_rank;
-
-  try {
-    if (!Object.keys(payload).length) {
-      return res.json({ ok: true, updated: 0 });
-    }
-
-    const supabase = sb();
-    const { error } = await supabase.from("items").update(payload).eq("id", id);
-    if (error) throw error;
-
-    res.json({ ok: true, updated: 1 });
-  } catch (err) {
-    console.error("POST /items/:id/factors error:", err);
-    res.status(500).json({ error: "save_factors_failed" });
-  }
-});
-
-// ---------- create new item (UI posts to /items/new)
-app.post(["/api/items/new", "/items/new"], async (req, res) => {
-  try {
-    const supabase = sb();
-
-    const org =
-      (req.query.org ||
-        req.body?.org ||
-        req.body?.org_slug ||
-        DEFAULT_ORG) + "";
-    const title = safeTitle(req.body?.title, req.body?.transcript);
-    const transcript = (req.body?.transcript || "").toString().trim() || null;
-
-    // Optional metadata from UI
-    const originator_name =
-      (req.body?.originator_name || req.body?.user_name || "").trim() || null;
+    const title = clean(body.title) || "(untitled)";
     const user_id =
-      (req.body?.user_id || req.body?.phone || req.body?.uid || "").trim() ||
+      clean(body.user_id) ||
+      clean(req.headers["x-user-id"]) ||
+      clean(req.headers["x-user"]) ||
       null;
 
-    const team_energy = safeInt(req.body?.team_energy);
-    const frequency = safeInt(req.body?.frequency);
-    const ease = safeInt(req.body?.ease);
-    const priority_rank = safeInt(req.body?.priority_rank);
-
-    const row = {
+    const insertRow = {
       org_slug: org,
-      title,
-      transcript,
-      originator_name,
       user_id,
-      team_energy,
-      frequency,
-      ease,
-      priority_rank,
+      title,
+      transcript: clean(body.transcript) || null,
+      // allow UI to optionally include initial factors
+      priority_rank:
+        typeof body.priority_rank === "number" ? body.priority_rank : null,
+      frequency: typeof body.frequency === "number" ? body.frequency : null,
+      ease: typeof body.ease === "number" ? body.ease : null,
+      team_energy:
+        typeof body.team_energy === "number" ? body.team_energy : null,
+      leader_to_unblock:
+        typeof body.leader_to_unblock === "boolean"
+          ? body.leader_to_unblock
+          : false,
     };
-
-    // Remove undefined keys
-    Object.keys(row).forEach((k) => row[k] === undefined && delete row[k]);
 
     const { data, error } = await supabase
       .from("items")
-      .insert(row)
+      .insert([insertRow])
       .select("id")
       .single();
 
     if (error) throw error;
 
-    res.status(201).json({ ok: true, id: data?.id });
-  } catch (err) {
-    console.error("POST /items/new error:", err);
-    res.status(500).json({ error: "add_failed" });
+    return res.status(201).json({ id: data.id });
+  } catch (e) {
+    console.error("POST /items/new error:", e);
+    return res.status(404).json({ error: "add_failed" }); // UI expects 404->“save failed” toast
   }
 });
 
-// ---------- update basic fields (title/transcript) if UI sends it
-app.put(["/api/items/:id", "/items/:id"], async (req, res) => {
-  const { id } = req.params;
+// Update an item’s factor sliders
+app.post("/items/:id/factors", async (req, res) => {
   try {
-    const payload = {};
-    if (typeof req.body?.title === "string")
-      payload.title = safeTitle(req.body.title, req.body.transcript);
-    if (typeof req.body?.transcript === "string")
-      payload.transcript = req.body.transcript;
+    const id = clean(req.params.id);
+    if (!id) return res.status(400).json({ error: "bad_id" });
 
-    if (!Object.keys(payload).length) {
-      return res.json({ ok: true, updated: 0 });
-    }
+    const body = req.body || {};
+    const patch = {};
 
-    const supabase = sb();
-    const { error } = await supabase.from("items").update(payload).eq("id", id);
+    if (typeof body.customer_impact === "number")
+      patch.priority_rank = body.customer_impact; // your UI names it customer_impact; DB uses priority_rank
+    if (typeof body.team_energy === "number") patch.team_energy = body.team_energy;
+    if (typeof body.frequency === "number") patch.frequency = body.frequency;
+    if (typeof body.ease === "number") patch.ease = body.ease;
+
+    if (Object.keys(patch).length === 0)
+      return res.status(200).json({ ok: true }); // nothing to change
+
+    const { error } = await supabase.from("items").update(patch).eq("id", id);
+
     if (error) throw error;
 
-    res.json({ ok: true, updated: 1 });
-  } catch (err) {
-    console.error("PUT /items/:id error:", err);
-    res.status(500).json({ error: "update_failed" });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /items/:id/factors error:", e);
+    return res.status(404).json({ error: "save_failed" }); // UI expects 404->“save failed”
   }
 });
 
-// ---------- fallback
-app.use((_req, res) => res.status(404).send("Not found"));
-
+// ---- START ----
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`felma-backend running on ${PORT}`);
 });
