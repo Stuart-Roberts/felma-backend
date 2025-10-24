@@ -1,243 +1,298 @@
-// Minimal, defensive backend for Render + Supabase (HTTP client)
-const express = require('express');
-const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
+// Minimal Express + Supabase backend (defensive & UI-friendly)
+
+const express = require("express");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
 
 const PORT = process.env.PORT || 10000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY;
-const DEFAULT_ORG = process.env.DEFAULT_ORG || 'stmichaels';
 
-if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error('Missing SUPABASE_URL or ADMIN_KEY env vars');
-  process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, ADMIN_KEY);
+// ---- CORS ----
+const ORIGIN = (process.env.CORS_ORIGIN || "").trim() || "*";
 const app = express();
-
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: "1mb" }));
 app.use(
   cors({
-    origin: CORS_ORIGIN,
-    credentials: false,
-    allowedHeaders: ['Content-Type'],
-    methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
-    maxAge: 86400,
+    origin: ORIGIN,
   })
 );
 
-// ---- utilities --------------------------------------------------------------
-function coerceNum(x, min = 0, max = 10) {
-  if (x === null || x === undefined || x === '') return null;
-  const n = Number(x);
-  if (Number.isNaN(n)) return null;
-  return Math.max(min, Math.min(max, n));
+// ---- Supabase ----
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const ADMIN_KEY = process.env.ADMIN_KEY;
+if (!SUPABASE_URL || !ADMIN_KEY) {
+  console.error("Missing SUPABASE_URL or ADMIN_KEY env var!");
 }
-// Defensive update that drops unknown columns (42703) and retries
-async function safeUpdateItem(id, patch) {
-  // never send empty payload
-  const payload = { ...patch };
-  if (Object.keys(payload).length === 0) return { data: null, error: null };
+const supabase = createClient(SUPABASE_URL, ADMIN_KEY);
 
-  // 3 attempts max
-  for (let i = 0; i < 3; i++) {
-    const { data, error } = await supabase.from('items').update(payload).eq('id', id).select('*').limit(1);
-    if (!error) return { data: data?.[0] || null, error: null };
+const DEF_ORG = (process.env.DEFAULT_ORG || "").trim() || null;
 
-    // If unknown column, remove it and retry
-    if (error.code === '42703' && /column\s+(\w+)/i.test(error.message || '')) {
-      const bad = error.message.match(/column\s+(\w+)/i)[1];
-      delete payload[bad];
-      continue;
-    }
-    return { data: null, error };
-  }
-  return { data: null, error: new Error('update_failed_after_retries') };
+// ---- helpers ----
+const isUUID = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s || "");
+const looksLikePhone = (s) => typeof s === "string" && s.replace(/[^\d+]/g, "").length >= 10;
+const safeTitle = (t, transcript) => {
+  const s = (t || "").toString().trim();
+  if (s) return s.slice(0, 80);
+  const tt = (transcript || "").toString().trim();
+  if (tt) return tt.replace(/\s+/g, " ").slice(0, 80);
+  return "(untitled)";
+};
+const numOrNull = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+
+async function getOrg(req) {
+  return (req.query.org || DEF_ORG || "").toString().trim();
 }
 
-// ---- routes ----------------------------------------------------------------
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
+// find the current user (“me”) by phone/email/id
+async function getMeProfile(org, meRaw) {
+  const me = (meRaw || "").toString().trim();
+  if (!me) return null;
 
-// People list (defensive: select only columns we’ve actually seen)
-app.get('/api/people', async (req, res) => {
-  try {
+  // try phone
+  if (looksLikePhone(me)) {
     const { data, error } = await supabase
-      .from('profiles')
-      .select('id,email,full_name,display_name,phone')
-      .order('full_name', { ascending: true, nullsFirst: false });
+      .from("profiles")
+      .select("id, phone, email, full_name, display_name")
+      .eq("org_slug", org)
+      .eq("phone", me)
+      .limit(1)
+      .maybeSingle();
+    if (!error && data) return data;
+  }
+
+  // try email
+  if (me.includes("@")) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, phone, email, full_name, display_name")
+      .eq("org_slug", org)
+      .eq("email", me)
+      .limit(1)
+      .maybeSingle();
+    if (!error && data) return data;
+  }
+
+  // try exact id
+  if (isUUID(me)) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, phone, email, full_name, display_name")
+      .eq("org_slug", org)
+      .eq("id", me)
+      .limit(1)
+      .maybeSingle();
+    if (!error && data) return data;
+  }
+
+  return null;
+}
+
+// build a map of profile.id -> display_name and phone->display_name for an org
+async function getProfileMaps(org) {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, phone, display_name")
+    .eq("org_slug", org);
+  const idToName = new Map();
+  const phoneToName = new Map();
+  if (!error && Array.isArray(data)) {
+    data.forEach((p) => {
+      if (p?.id) idToName.set(p.id, p.display_name || null);
+      if (p?.phone) phoneToName.set(p.phone, p.display_name || null);
+    });
+  }
+  return { idToName, phoneToName };
+}
+
+// map DB row -> API item with fallbacks & “is_me”
+function normalizeItem(row, { idToName, phoneToName }, meProfile, meRaw) {
+  const title = safeTitle(row.title, row.transcript);
+  const user_id = row.user_id ?? null;
+
+  let originator_name = row.originator_name ?? null;
+  if (!originator_name && user_id && isUUID(user_id) && idToName.has(user_id)) {
+    originator_name = idToName.get(user_id);
+  }
+  if (!originator_name && looksLikePhone(user_id) && phoneToName.has(user_id)) {
+    originator_name = phoneToName.get(user_id);
+  }
+
+  const meStr = (meRaw || "").toString().trim();
+  const is_me =
+    !!meProfile?.id && user_id && isUUID(user_id) && user_id === meProfile.id
+      ? true
+      : looksLikePhone(meStr) && user_id && looksLikePhone(user_id) && user_id === meStr
+      ? true
+      : false;
+
+  return {
+    id: row.id,
+    created_at: row.created_at,
+    org_slug: row.org_slug || row.org || null,
+    user_id,
+    title,
+    transcript: row.transcript || null,
+    action_tier: row.action_tier ?? null,
+    priority_rank: row.priority_rank ?? null,
+    frequency: row.frequency ?? null,
+    ease: row.ease ?? null,
+    leader_to_unblock: row.leader_to_unblock ?? row.leader_to_unlock ?? null, // tolerate old/new names
+    originator_name: originator_name ?? null,
+    is_me,
+  };
+}
+
+// update helper that retries if a column doesn’t exist (42703)
+async function safeUpdateItem(id, patch) {
+  // map accidental field from UI
+  if ("leader_to_unlock" in patch && !("leader_to_unblock" in patch)) {
+    patch.leader_to_unblock = patch.leader_to_unlock;
+    delete patch.leader_to_unlock;
+  }
+
+  // remove undefineds
+  Object.keys(patch).forEach((k) => patch[k] === undefined && delete patch[k]);
+
+  let fields = { ...patch };
+  while (true) {
+    if (!Object.keys(fields).length) {
+      return { ok: true, data: null, removed: true }; // nothing left to update
+    }
+    const { data, error } = await supabase.from("items").update(fields).eq("id", id).select("id").maybeSingle();
+    if (!error) return { ok: true, data };
+    if (error.code === "42703") {
+      // find missing column name and drop it, then retry
+      const m = /column\s+(?:\w+\.)?"?([\w_]+)"?\s+does not exist/i.exec(error.message || "");
+      if (m && fields[m[1]] !== undefined) {
+        delete fields[m[1]];
+        continue;
+      }
+    }
+    return { ok: false, error };
+  }
+}
+
+// ---- routes ----
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// list people (profiles)
+app.get("/api/people", async (req, res) => {
+  try {
+    const org = await getOrg(req);
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email, phone, full_name, display_name, is_leader, org_slug")
+      .eq("org_slug", org);
 
     if (error) throw error;
 
     const people = (data || []).map((p) => ({
       id: p.id,
       email: p.email || null,
-      full_name: p.full_name || null,
-      display_name: p.display_name || null,
       phone: p.phone || null,
+      full_name: p.full_name || null,
+      display_name: p.display_name || p.full_name || null,
+      is_leader: !!p.is_leader,
+      org_slug: p.org_slug || org,
     }));
-    res.json(people);
+
+    res.json({ people });
   } catch (err) {
-    console.error('GET /api/people error:', err);
-    res.status(500).json({ error: 'people_failed' });
+    console.error("GET /api/people error:", err);
+    res.status(500).json({ error: "people_failed" });
   }
 });
 
-// List items (with ordering)
-app.get('/api/list', async (req, res) => {
-  const org = (req.query.org || DEFAULT_ORG || '').trim() || null;
-  const orderParam = String(req.query.order || 'rank_desc').toLowerCase();
-
-  // default order: higher rank first (desc), then newest first
-  const byRankAsc = orderParam === 'rank_asc';
-  const byRankDesc = orderParam === 'rank_desc';
-  const byNewest = orderParam === 'newest';
-  const byOldest = orderParam === 'oldest';
+// list items (ranked by default)
+app.get("/api/list", async (req, res) => {
+  const org = await getOrg(req);
+  const me = (req.query.me || "").toString();
 
   try {
-    let q = supabase
-      .from('items')
-      .select('id,created_at,org_slug,user_id,title,transcript,originator_name,priority_rank,frequency,ease,leader_to_unblock');
+    // fetch items defensively (select * to avoid missing-column errors)
+    let q = supabase.from("items").select("*").eq("org_slug", org);
 
-    if (org) q = q.eq('org_slug', org);
+    // default sort: priority_rank desc NULLS LAST, then created_at desc
+    q = q.order("priority_rank", { ascending: false, nullsFirst: false }).order("created_at", { ascending: false });
 
-    // Apply ordering
-    if (byNewest) {
-      q = q.order('created_at', { ascending: false });
-    } else if (byOldest) {
-      q = q.order('created_at', { ascending: true });
-    } else if (byRankAsc) {
-      q = q.order('priority_rank', { ascending: true, nullsFirst: false }).order('created_at', { ascending: false });
-    } else {
-      // rank_desc (default)
-      q = q.order('priority_rank', { ascending: false, nullsFirst: true }).order('created_at', { ascending: false });
-    }
-
-    const { data, error } = await q;
+    const [{ data: rows, error }, meProfile, maps] = await Promise.all([
+      q,
+      getMeProfile(org, me),
+      getProfileMaps(org),
+    ]);
     if (error) throw error;
 
-    const items = (data || []).map((r) => {
-      const rawTitle = (r.title || '').trim();
-      const safeTitle =
-        rawTitle && rawTitle.length
-          ? rawTitle
-          : (r.transcript || '').trim().replace(/\s+/g, ' ').slice(0, 90) || '(untitled)';
-
-      return {
-        id: r.id,
-        created_at: r.created_at,
-        org_slug: r.org_slug || null,
-        user_id: r.user_id || null,
-        title: safeTitle,
-        transcript: r.transcript || null,
-        originator_name: r.originator_name || null,
-        priority_rank: r.priority_rank ?? null,
-        frequency: r.frequency ?? null,
-        ease: r.ease ?? null,
-        leader_to_unblock: r.leader_to_unblock ?? null,
-      };
-    });
-
+    const items = (rows || []).map((r) => normalizeItem(r, maps, meProfile, me));
     res.json({ items });
   } catch (err) {
-    console.error('GET /api/list error:', err);
-    res.status(500).json({ error: 'list_failed' });
+    console.error("GET /api/list error:", err);
+    res.status(500).json({ error: "list_failed" });
   }
 });
 
-// Create new item (kept for completeness if your UI uses it)
-app.post('/api/items/new', async (req, res) => {
+// create a new item
+app.post("/api/items/new", async (req, res) => {
   try {
-    const org = (req.query.org || DEFAULT_ORG || '').trim() || null;
-    const { title, transcript, originator_name, user_id } = req.body || {};
-    const safeTitle =
-      (title || '').trim() ||
-      (transcript || '').trim().replace(/\s+/g, ' ').slice(0, 90) ||
-      '(untitled)';
+    const org = (req.body.org || req.query.org || DEF_ORG || "").toString().trim();
+    const me = (req.body.me || req.query.me || "").toString().trim();
+    const meProfile = await getMeProfile(org, me);
 
-    const insert = {
-      org_slug: org,
-      title: safeTitle,
+    const transcript = (req.body.transcript || "").toString();
+    const title = safeTitle(req.body.title, transcript);
+
+    const insertRow = {
+      title,
       transcript: transcript || null,
-      originator_name: originator_name || null,
-      user_id: user_id || null,
+      org_slug: org,
+      user_id: meProfile?.id || (looksLikePhone(me) ? me : null),
     };
 
-    const { data, error } = await supabase.from('items').insert([insert]).select('id').single();
+    const { data, error } = await supabase.from("items").insert(insertRow).select("id").single();
     if (error) throw error;
+
     res.json({ ok: true, id: data.id });
   } catch (err) {
-    console.error('POST /api/items/new error:', err);
-    res.status(500).json({ error: 'new_failed' });
+    console.error("POST /api/items/new error:", err);
+    res.status(500).json({ error: "add_failed" });
   }
 });
 
-// ---- Save/update routes (3 aliases so the UI won’t 404) --------------------
-
-// PATCH /api/items/:id   (preferred)
-app.patch('/api/items/:id', async (req, res) => {
-  const id = req.params.id;
-  const patch = req.body || {};
-
-  // sanitize known fields (others will be tried/auto-dropped if unknown)
-  const clean = {};
-  if (patch.title !== undefined) clean.title = (patch.title || '').trim() || null;
-  if (patch.priority_rank !== undefined) clean.priority_rank = coerceNum(patch.priority_rank, -9999, 9999);
-  if (patch.frequency !== undefined) clean.frequency = coerceNum(patch.frequency, 0, 10);
-  if (patch.ease !== undefined) clean.ease = coerceNum(patch.ease, 0, 10);
-  if (patch.team_energy !== undefined) clean.team_energy = coerceNum(patch.team_energy, 0, 10);
-  if (patch.leader_to_unblock !== undefined) clean.leader_to_unblock = !!patch.leader_to_unblock;
-
+// update factors / generic update (aliases to catch unknown UI routes)
+async function handleUpdate(req, res, idFromPath) {
   try {
-    const { data, error } = await safeUpdateItem(id, clean);
-    if (error) throw error;
-    res.json({ ok: true, id, item: data });
+    const id = (idFromPath || req.body.id || req.query.id || "").toString();
+    if (!isUUID(id)) return res.status(400).json({ error: "bad_id" });
+
+    const patch = {
+      // tolerate either name; we’ll remap in safeUpdateItem
+      leader_to_unlock: req.body.leader_to_unlock,
+      leader_to_unblock: req.body.leader_to_unblock,
+      action_tier: req.body.action_tier,
+      priority_rank: numOrNull(req.body.priority_rank),
+      frequency: numOrNull(req.body.frequency),
+      ease: numOrNull(req.body.ease),
+      title: req.body.title,
+      transcript: req.body.transcript,
+    };
+
+    const result = await safeUpdateItem(id, patch);
+    if (!result.ok) {
+      console.error("Update failed:", result.error);
+      return res.status(500).json({ error: "save_failed" });
+    }
+    res.json({ ok: true, id });
   } catch (err) {
-    console.error('PATCH /api/items/:id error:', err);
-    res.status(500).json({ error: 'save_failed' });
+    console.error("POST update error:", err);
+    res.status(500).json({ error: "save_failed" });
   }
-});
+}
 
-// POST /api/items/:id/factors  (compat)
-app.post('/api/items/:id/factors', async (req, res) => {
-  const id = req.params.id;
-  const body = req.body || {};
-  const clean = {
-    // accept both names in case UI varies
-    team_energy: coerceNum(body.team_energy ?? body.teamEnergy, 0, 10),
-    frequency: coerceNum(body.frequency, 0, 10),
-    ease: coerceNum(body.ease, 0, 10),
-  };
-  if (body.title !== undefined) clean.title = (body.title || '').trim() || null;
-  if (body.leader_to_unblock !== undefined) clean.leader_to_unblock = !!body.leader_to_unblock;
+// common aliases so your UI won’t 404
+app.post("/api/items/save", (req, res) => handleUpdate(req, res, null));
+app.post("/api/items/update", (req, res) => handleUpdate(req, res, null));
+app.post("/api/save", (req, res) => handleUpdate(req, res, null));
+app.post("/api/items/:id", (req, res) => handleUpdate(req, res, req.params.id));
+app.post("/api/items/:id/factors", (req, res) => handleUpdate(req, res, req.params.id));
 
-  try {
-    const { data, error } = await safeUpdateItem(id, clean);
-    if (error) throw error;
-    res.json({ ok: true, id, item: data });
-  } catch (err) {
-    console.error('POST /api/items/:id/factors error:', err);
-    res.status(500).json({ error: 'save_failed' });
-  }
-});
-
-// POST /api/items/:id/update (compat)
-app.post('/api/items/:id/update', async (req, res) => {
-  const id = req.params.id;
-  try {
-    const { data, error } = await safeUpdateItem(id, req.body || {});
-    if (error) throw error;
-    res.json({ ok: true, id, item: data });
-  } catch (err) {
-    console.error('POST /api/items/:id/update error:', err);
-    res.status(500).json({ error: 'save_failed' });
-  }
-});
-
-// ---------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`felma-backend running on ${PORT}`);
 });
