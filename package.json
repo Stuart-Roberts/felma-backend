@@ -1,18 +1,14 @@
 {
   "name": "felma-backend",
-  "version": "1.0.0",
   "private": true,
-  "main": "index.js",
   "type": "commonjs",
+  "engines": { "node": ">=20" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.2",
+    "@supabase/supabase-js": "^2.45.0",
     "cors": "^2.8.5",
     "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=20.0.0"
   }
 }
