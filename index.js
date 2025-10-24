@@ -1,142 +1,147 @@
-// Minimal Express backend for Render + Supabase (HTTP)
-// CommonJS. Handles CORS and robust list/people endpoints.
+// felma-backend/index.js
+// CommonJS backend for Render + Supabase (via HTTP).
+// Endpoints: /api/health, /api/people, /api/list
+// ENV required: SUPABASE_URL, ADMIN_KEY
+// Optional: CORS_ORIGIN (single origin), DEFAULT_ORG (e.g. "stmichaels")
 
 const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
+const app = express();
 const PORT = process.env.PORT || 10000;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY; // service_role key
-const DEFAULT_ORG = (process.env.DEFAULT_ORG || "").trim();
-const CORS_ORIGIN = (process.env.CORS_ORIGIN || "").trim(); // e.g. https://felma-ui.onrender.com
-
-if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error("Missing SUPABASE_URL or ADMIN_KEY env.");
-  process.exit(1);
-}
-
-const app = express();
-app.use(express.json());
-
-// CORS: single origin recommended in Render env (no commas)
+// ---------- CORS (strict but safe) ----------
+const ALLOW_ORIGIN = (process.env.CORS_ORIGIN || "").trim();
 app.use(
   cors({
-    origin: CORS_ORIGIN || true, // mirror origin if not set
-    credentials: false,
+    origin(origin, cb) {
+      // allow same-origin / curl / server-to-server (no origin)
+      if (!ALLOW_ORIGIN || !origin) return cb(null, true);
+      if (origin === ALLOW_ORIGIN) return cb(null, true);
+      return cb(new Error("CORS: origin not allowed"), false);
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-const supabase = createClient(SUPABASE_URL, ADMIN_KEY, {
-  auth: { persistSession: false },
-  global: { headers: { "X-Client-Info": "felma-backend" } },
-});
+// ---------- Body ----------
+app.use(express.json({ limit: "1mb" }));
 
-// title fallback
-function safeTitle(row) {
-  const t = (row.title || "").trim();
-  if (t) return t.slice(0, 80);
-  const tr = (row.transcript || "").replace(/\s+/g, " ").trim();
-  return tr ? tr.slice(0, 80) : "(untitled)";
+// ---------- Supabase ----------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const ADMIN_KEY = process.env.ADMIN_KEY; // service_role
+
+if (!SUPABASE_URL || !ADMIN_KEY) {
+  console.error(
+    "Missing SUPABASE_URL or ADMIN_KEY env. Set these in Render → Environment."
+  );
 }
 
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
+const supabase = createClient(SUPABASE_URL || "", ADMIN_KEY || "", {
+  auth: { persistSession: false },
+  global: { headers: { "x-application-name": "felma-backend" } },
+});
 
+// ---------- Helpers ----------
+function safeTitle({ title, transcript }) {
+  const t = (title || "").trim();
+  if (t) return t;
+  const snip = (transcript || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  return snip || "(untitled)";
+}
+
+// ---------- Routes ----------
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "felma-backend",
+    time: new Date().toISOString(),
+  });
+});
+
+// People: from public.profiles
 app.get("/api/people", async (_req, res) => {
   try {
     const { data, error } = await supabase
       .from("profiles")
-      .select("id,email,phone,full_name,display_name")
-      .order("full_name", { ascending: true });
+      // only columns we know exist in your screenshots
+      .select("id, display_name, full_name, email, phone");
 
     if (error) throw error;
 
     const people = (data || []).map((p) => ({
       id: p.id,
-      email: p.email,
-      phone: p.phone || null,
+      display_name: p.display_name || null,
       full_name: p.full_name || null,
-      display_name:
-        p.display_name || p.full_name || (p.email ? p.email.split("@")[0] : "Unknown"),
+      email: p.email || null,
+      phone: p.phone || null,
     }));
 
-    res.json({ people });
+    res.json({ ok: true, people });
   } catch (err) {
     console.error("GET /api/people error:", err);
     res.status(500).json({ error: "people_failed" });
   }
 });
 
+// Items list for an org: fetch items, then fetch related people and merge
 app.get("/api/list", async (req, res) => {
+  const org = (req.query.org || process.env.DEFAULT_ORG || "stmichaels").trim();
+
   try {
-    const org = (req.query.org || DEFAULT_ORG || "").trim();
-
-    // Fetch items (only columns we know exist in your DB)
-    let q = supabase
+    // 1) Fetch items. Use "*" to avoid column-name mismatches.
+    //    Order safely by created_at (exists on your table).
+    const { data: items, error: itemsErr } = await supabase
       .from("items")
-      .select(
-        "id,created_at,user_id,title,transcript,priority_rank,action_title,leader_to_unlock,org_slug"
-      );
+      .select("*")
+      .eq("org_slug", org)
+      .order("created_at", { ascending: false });
 
-    if (org) q = q.eq("org_slug", org);
-    q = q.order("priority_rank", { ascending: false, nullsLast: true })
-         .order("created_at", { ascending: false });
+    if (itemsErr) throw itemsErr;
 
-    const { data: items, error } = await q;
-    if (error) throw error;
+    // 2) Build set of user_ids and fetch matching profiles
+    const ids = [...new Set((items || []).map((i) => i.user_id).filter(Boolean))];
 
-    if (!items || items.length === 0) {
-      return res.json({ items: [] });
-    }
-
-    // Enrich with originator name/phone from profiles
-    const ids = [...new Set(items.map((i) => i.user_id).filter(Boolean))];
-    const map = new Map();
-
+    let peopleMap = new Map();
     if (ids.length) {
-      const { data: profs, error: pErr } = await supabase
+      const { data: ppl, error: pplErr } = await supabase
         .from("profiles")
-        .select("id,display_name,full_name,email,phone")
+        .select("id, display_name, phone")
         .in("id", ids);
 
-      if (pErr) throw pErr;
-
-      for (const p of profs || []) {
-        map.set(p.id, {
-          originator_name:
-            p.display_name ||
-            p.full_name ||
-            (p.email ? p.email.split("@")[0] : "Unknown"),
-          phone: p.phone || null,
-        });
-      }
+      if (pplErr) throw pplErr;
+      peopleMap = new Map((ppl || []).map((p) => [p.id, p]));
     }
 
-    const out = items.map((row) => {
-      const info = map.get(row.user_id) || {};
+    // 3) Build response rows with safe title + merged person fields
+    const rows = (items || []).map((i) => {
+      const person = peopleMap.get(i.user_id) || {};
       return {
-        id: row.id,
-        created_at: row.created_at,
-        user_id: row.user_id,
-        org_slug: row.org_slug || org || null,
-        priority_rank: row.priority_rank ?? null,
-        action_title: row.action_title ?? null,
-        leader_to_unlock: row.leader_to_unlock ?? null,
-        title: safeTitle(row),
-        transcript: row.transcript || null,
-        originator_name: info.originator_name || null,
-        phone: info.phone || null,
+        id: i.id,
+        created_at: i.created_at,
+        user_id: i.user_id || null,
+        org_slug: i.org_slug || org,
+        title: safeTitle({ title: i.title, transcript: i.transcript }),
+        transcript: i.transcript || null,
+        priority_rank: i.priority_rank ?? null, // may or may not exist in your schema
+        action_tier: i.action_tier ?? null,     // may or may not exist in your schema
+        leader_to_unlock: i.leader_to_unlock ?? null,
+        originator_name: person.display_name || null,
+        phone: person.phone || null,
       };
     });
 
-    res.json({ items: out });
+    res.json({ ok: true, rows });
   } catch (err) {
     console.error("GET /api/list error:", err);
     res.status(500).json({ error: "list_failed" });
   }
 });
 
+// ---------- Start ----------
 app.listen(PORT, () => {
   console.log(`felma-backend running on ${PORT}`);
 });
