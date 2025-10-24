@@ -3,19 +3,19 @@ const express = require("express");
 const cors = require("cors");
 const { createClient } = require("@supabase/supabase-js");
 
-// ---- ENV ----
+// --- ENV ---
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
 
 if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error("Missing SUPABASE_URL or ADMIN_KEY env vars.");
+  console.error("Missing SUPABASE_URL or ADMIN_KEY");
 }
 
 const supabase = createClient(SUPABASE_URL, ADMIN_KEY);
 
-// ---- APP ----
+// --- APP ---
 const app = express();
 app.use(express.json());
 app.use(
@@ -33,43 +33,18 @@ const toNum = (v) => {
   return Number.isFinite(n) ? n : null;
 };
 
-// ---- HEALTH ----
+// --- HEALTH ---
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
 
-// ---- PEOPLE (robust to id/uuid/uid) ----
+// --- PEOPLE (robust to id/uuid/uid; no fragile column list) ---
 app.get("/api/people", async (_req, res) => {
   try {
-    const attempts = [
-      "id,email,phone,full_name,display_name",
-      "uuid,email,phone,full_name,display_name",
-      "uid,email,phone,full_name,display_name",
-    ];
+    const { data, error } = await supabase.from("profiles").select("*");
+    if (error) throw error;
 
-    let rows = null;
-    let lastErr = null;
-
-    for (const cols of attempts) {
-      const { data, error } = await supabase
-        .from("profiles")
-        .select(cols)
-        .order("full_name", { ascending: true, nullsFirst: true });
-
-      if (!error) {
-        rows = data;
-        break;
-      }
-      if (error.code !== "42703") {
-        lastErr = error;
-        break;
-      }
-      lastErr = error;
-    }
-
-    if (!rows) throw lastErr || new Error("profiles query failed");
-
-    const people = rows.map((r) => ({
+    const people = (data || []).map((r) => ({
       id: r.id || r.uuid || r.uid || null,
       email: clean(r.email),
       phone: clean(r.phone),
@@ -84,10 +59,9 @@ app.get("/api/people", async (_req, res) => {
   }
 });
 
-// ---- LIST (keeps { items: [...] }) ----
+// --- LIST (rank desc, then newest) ---
 app.get("/api/list", async (req, res) => {
   const org = clean(req.query.org) || DEFAULT_ORG;
-
   try {
     const fields = [
       "id",
@@ -141,9 +115,9 @@ app.get("/api/list", async (req, res) => {
   }
 });
 
-// ---- UI WRITE ENDPOINTS (no /api prefix; UI calls these) ----
+// --- UI write/read endpoints (no /api prefix; the UI calls these) ---
 
-// Create a new item
+// Create new item
 app.post("/items/new", async (req, res) => {
   try {
     const org = clean(req.query.org) || DEFAULT_ORG;
@@ -164,7 +138,6 @@ app.post("/items/new", async (req, res) => {
       team_energy: toNum(body.team_energy),
       frequency: toNum(body.frequency),
       ease: toNum(body.ease),
-
       leader_to_unblock:
         typeof body.leader_to_unblock === "boolean"
           ? body.leader_to_unblock
@@ -178,11 +151,9 @@ app.post("/items/new", async (req, res) => {
       .single();
 
     if (error) throw error;
-
     return res.status(201).json({ id: data.id });
   } catch (e) {
     console.error("POST /items/new error:", e);
-    // UI shows "add failed 404" on non-2xx; keep that behavior
     return res.status(404).json({ error: "add_failed" });
   }
 });
@@ -195,8 +166,6 @@ app.post("/items/:id/factors", async (req, res) => {
 
     const body = req.body || {};
     const patch = {};
-
-    // Coerce numeric strings -> numbers
     const ci = toNum(body.customer_impact);
     const te = toNum(body.team_energy);
     const fq = toNum(body.frequency);
@@ -217,12 +186,35 @@ app.post("/items/:id/factors", async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     console.error("POST /items/:id/factors error:", e);
-    // UI shows "save failed 404" on non-2xx; keep that behavior
     return res.status(404).json({ error: "save_failed" });
   }
 });
 
-// ---- START ----
+// Prefill factors for drawer (the UI GETs this)
+app.get("/items/:id/factors", async (req, res) => {
+  try {
+    const id = clean(req.params.id);
+    const { data, error } = await supabase
+      .from("items")
+      .select("priority_rank,team_energy,frequency,ease")
+      .eq("id", id)
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: "not_found" });
+
+    return res.json({
+      customer_impact: toNum(data.priority_rank),
+      team_energy: toNum(data.team_energy),
+      frequency: toNum(data.frequency),
+      ease: toNum(data.ease),
+    });
+  } catch (e) {
+    console.error("GET /items/:id/factors error:", e);
+    return res.status(500).json({ error: "factors_failed" });
+  }
+});
+
+// --- START ---
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`felma-backend running on ${PORT}`);
