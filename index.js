@@ -1,5 +1,5 @@
 // felma-backend/index.js
-// Complete working version with profiles endpoint
+// Complete working version with title update
 
 const express = require("express");
 const cors = require("cors");
@@ -148,6 +148,35 @@ app.post("/api/items/new", async (req, res) => {
   }
 });
 
+// Update item (title, etc)
+app.patch("/api/items/:id", async (req, res) => {
+  try {
+    const id = clean(req.params.id);
+    if (!id) return res.status(400).json({ error: "bad_id" });
+
+    const body = req.body || {};
+    const updates = {};
+
+    if (body.title) updates.title = clean(body.title);
+
+    if (Object.keys(updates).length === 0) {
+      return res.json({ ok: true, message: "no_changes" });
+    }
+
+    const { error } = await supabase
+      .from("items")
+      .update(updates)
+      .eq("id", id);
+
+    if (error) throw error;
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("PATCH /api/items/:id error:", e);
+    res.status(500).json({ error: "update_failed" });
+  }
+});
+
 // Update item factors (4 sliders)
 app.post("/api/items/:id/factors", async (req, res) => {
   try {
@@ -232,6 +261,11 @@ app.get("/api/items/:id/factors", async (req, res) => {
 // Route aliases (UI sometimes calls without /api prefix)
 app.post("/items/new", (req, res) => {
   req.url = "/api/items/new";
+  app._router.handle(req, res);
+});
+
+app.patch("/items/:id", (req, res) => {
+  req.url = `/api/items/${req.params.id}`;
   app._router.handle(req, res);
 });
 
