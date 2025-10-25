@@ -1,5 +1,5 @@
 // felma-backend/index.js
-// Complete working version with title update
+// Complete with correct priority rank formula
 
 const express = require("express");
 const cors = require("cors");
@@ -45,6 +45,19 @@ function toNum(val) {
 
 function clean(str) {
   return typeof str === "string" ? str.trim() : (str || null);
+}
+
+// CORRECT PRIORITY RANK FORMULA
+function computePriorityRank(customer_impact, team_energy, frequency, ease) {
+  const ci = Number(customer_impact || 0);
+  const te = Number(team_energy || 0);
+  const fq = Number(frequency || 0);
+  const ez = Number(ease || 0);
+  
+  const a = 0.57 * ci + 0.43 * te;
+  const b = 0.6 * fq + 0.4 * ez;
+  
+  return Math.round(a * b);
 }
 
 // Health check
@@ -115,6 +128,32 @@ app.post("/api/items/new", async (req, res) => {
     const body = req.body || {};
     const org = clean(body.org_slug) || DEFAULT_ORG;
 
+    const ci = toNum(body.customer_impact);
+    const te = toNum(body.team_energy);
+    const fq = toNum(body.frequency);
+    const ez = toNum(body.ease);
+
+    // Calculate priority rank if we have all 4 factors
+    let priority_rank = toNum(body.priority_rank);
+    let action_tier = clean(body.action_tier);
+    let leader_to_unblock = typeof body.leader_to_unblock === "boolean" ? body.leader_to_unblock : false;
+
+    if (ci !== null && te !== null && fq !== null && ez !== null) {
+      priority_rank = computePriorityRank(ci, te, fq, ez);
+      
+      // Determine tier
+      if (priority_rank >= 60) {
+        action_tier = "Move now";
+      } else if (priority_rank >= 36) {
+        action_tier = "Move it forward";
+      } else {
+        action_tier = "When time allows";
+      }
+
+      // Leader to unblock: team_energy >= 9 AND ease <= 3
+      leader_to_unblock = (te >= 9 && ez <= 3);
+    }
+
     const insertRow = {
       org_slug: org,
       user_id: clean(body.user_id) || clean(body.from) || null,
@@ -123,13 +162,13 @@ app.post("/api/items/new", async (req, res) => {
       title: clean(body.title) || null,
       item_type: clean(body.item_type) || "frustration",
       response: clean(body.response) || null,
-      customer_impact: toNum(body.customer_impact),
-      team_energy: toNum(body.team_energy),
-      frequency: toNum(body.frequency),
-      ease: toNum(body.ease),
-      priority_rank: toNum(body.priority_rank),
-      action_tier: clean(body.action_tier),
-      leader_to_unblock: typeof body.leader_to_unblock === "boolean" ? body.leader_to_unblock : false,
+      customer_impact: ci,
+      team_energy: te,
+      frequency: fq,
+      ease: ez,
+      priority_rank: priority_rank,
+      action_tier: action_tier,
+      leader_to_unblock: leader_to_unblock,
       status: clean(body.status) || "open",
     };
 
@@ -198,15 +237,15 @@ app.post("/api/items/:id/factors", async (req, res) => {
 
     // Recalculate priority_rank if we have all 4 factors
     if (ci !== null && te !== null && fq !== null && ez !== null) {
-      updates.priority_rank = ci + te + fq + ez;
+      updates.priority_rank = computePriorityRank(ci, te, fq, ez);
       
       // Determine tier
-      if (updates.priority_rank >= 34) {
+      if (updates.priority_rank >= 60) {
+        updates.action_tier = "Move now";
+      } else if (updates.priority_rank >= 36) {
         updates.action_tier = "Move it forward";
-      } else if (updates.priority_rank >= 26) {
-        updates.action_tier = "When time allows";
       } else {
-        updates.action_tier = "Park for later";
+        updates.action_tier = "When time allows";
       }
 
       // Leader to unblock: team_energy >= 9 AND ease <= 3
