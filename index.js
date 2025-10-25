@@ -1,5 +1,5 @@
 // felma-backend/index.js
-// Complete working version with all routes and bug fixes
+// Complete working version with profiles endpoint
 
 const express = require("express");
 const cors = require("cors");
@@ -50,6 +50,23 @@ function clean(str) {
 // Health check
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "felma-backend" });
+});
+
+// Get all profiles (for user selection)
+app.get("/api/profiles", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, full_name, display_name, phone, email")
+      .order("full_name");
+
+    if (error) throw error;
+
+    res.json({ profiles: data || [] });
+  } catch (e) {
+    console.error("GET /api/profiles error:", e);
+    res.status(500).json({ error: "profiles_failed" });
+  }
 });
 
 // Get all items for an org
@@ -140,7 +157,6 @@ app.post("/api/items/:id/factors", async (req, res) => {
     const body = req.body || {};
     const updates = {};
 
-    // Map customer_impact to customer_impact column (not priority_rank)
     const ci = toNum(body.customer_impact);
     const te = toNum(body.team_energy);
     const fq = toNum(body.frequency);
@@ -153,10 +169,9 @@ app.post("/api/items/:id/factors", async (req, res) => {
 
     // Recalculate priority_rank if we have all 4 factors
     if (ci !== null && te !== null && fq !== null && ez !== null) {
-      // Simple formula: sum of all factors (you can adjust this)
       updates.priority_rank = ci + te + fq + ez;
       
-      // Determine tier based on priority_rank
+      // Determine tier
       if (updates.priority_rank >= 34) {
         updates.action_tier = "Move it forward";
       } else if (updates.priority_rank >= 26) {
@@ -165,7 +180,7 @@ app.post("/api/items/:id/factors", async (req, res) => {
         updates.action_tier = "Park for later";
       }
 
-      // Leader to unblock rule: team_energy >= 9 AND ease <= 3
+      // Leader to unblock: team_energy >= 9 AND ease <= 3
       updates.leader_to_unblock = (te >= 9 && ez <= 3);
     }
 
