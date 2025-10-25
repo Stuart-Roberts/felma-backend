@@ -1,324 +1,244 @@
-// felma-backend/index.js
-// Complete with correct priority rank formula
+// index.js – Felma backend (COMPLETE FILE WITH LIFECYCLE)
+// Node 18+; requires SUPABASE_URL and SUPABASE_KEY env vars
 
 const express = require("express");
-const cors = require("cors");
+const compression = require("compression");
 const { createClient } = require("@supabase/supabase-js");
+require("dotenv").config();
 
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-// CORS setup
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
-app.use(cors({
-  origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN,
-  credentials: false,
-  methods: ["GET", "POST", "PATCH", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
-
+app.use(compression());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// Supabase client
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const ADMIN_KEY = process.env.ADMIN_KEY;
-const DEFAULT_ORG = process.env.DEFAULT_ORG || "stmichaels";
-
-if (!SUPABASE_URL || !ADMIN_KEY) {
-  console.error("Missing SUPABASE_URL or ADMIN_KEY");
-  process.exit(1);
-}
-
-const supabase = createClient(SUPABASE_URL, ADMIN_KEY, {
-  auth: { persistSession: false }
+// permissive CORS for pilot
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
 });
 
-// Helper functions
-function toNum(val) {
-  if (typeof val === "number") return val;
-  if (typeof val === "string") {
-    const n = parseFloat(val);
-    return isNaN(n) ? null : n;
-  }
-  return null;
-}
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-function clean(str) {
-  return typeof str === "string" ? str.trim() : (str || null);
-}
-
-// CORRECT PRIORITY RANK FORMULA
+// ---------- helpers (rank, tier, leader flag) ----------
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
-  const ci = Number(customer_impact || 0);
-  const te = Number(team_energy || 0);
-  const fq = Number(frequency || 0);
-  const ez = Number(ease || 0);
-  
-  const a = 0.57 * ci + 0.43 * te;
-  const b = 0.6 * fq + 0.4 * ez;
-  
+  const a = 0.57 * customer_impact + 0.43 * team_energy;
+  const b = 0.6 * frequency + 0.4 * ease;
   return Math.round(a * b);
 }
 
-// Health check
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, service: "felma-backend" });
-});
+function tierForPR(pr) {
+  if (pr >= 70) return "🔥 Make it happen";
+  if (pr >= 50) return "🚀 Act on it now";
+  if (pr >= 36) return "🧭 Move it forward";
+  if (pr >= 25) return "🙂 When time allows";
+  return "⚪ Park for later";
+}
 
-// Get all profiles (for user selection)
-app.get("/api/profiles", async (req, res) => {
+function shouldLeaderUnblock(team_energy, ease) {
+  return team_energy >= 9 && ease <= 3;
+}
+
+function toNum(v) {
+  const n = Number(v);
+  return isNaN(n) ? null : n;
+}
+
+function clean(s) {
+  return typeof s === "string" ? s.trim() : "";
+}
+
+// ---------- health ----------
+app.get("/", (_req, res) => res.send("Felma server is running."));
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// ---------- list all items ----------
+app.get("/api/list", async (_req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, full_name, display_name, phone, email")
-      .order("full_name");
-
-    if (error) throw error;
-
-    res.json({ profiles: data || [] });
-  } catch (e) {
-    console.error("GET /api/profiles error:", e);
-    res.status(500).json({ error: "profiles_failed" });
-  }
-});
-
-// Get all items for an org
-app.get("/api/list", async (req, res) => {
-  try {
-    const org = clean(req.query.org) || DEFAULT_ORG;
-    
     const { data, error } = await supabase
       .from("items")
-      .select("*")
-      .eq("org_slug", org)
-      .order("priority_rank", { ascending: false, nullsLast: true })
+      .select(`
+        *,
+        stage,
+        stage_3_involve,
+        stage_4_choose,
+        stage_5_prepare,
+        stage_6_act,
+        stage_7_learn,
+        stage_8_recognise,
+        stage_9_share
+      `)
       .order("created_at", { ascending: false });
 
     if (error) throw error;
-
-    const items = (data || []).map(row => ({
-      id: row.id,
-      created_at: row.created_at,
-      org_slug: row.org_slug,
-      user_id: row.user_id || null,
-      originator_name: row.originator_name || null,
-      title: row.title || row.item_title || row.transcript || "(untitled)",
-      transcript: row.transcript || null,
-      customer_impact: row.customer_impact ?? null,
-      team_energy: row.team_energy ?? null,
-      frequency: row.frequency ?? null,
-      ease: row.ease ?? null,
-      priority_rank: row.priority_rank ?? null,
-      action_tier: row.action_tier || null,
-      leader_to_unblock: !!row.leader_to_unblock,
-      response: row.response || null,
-      status: row.status || null,
-    }));
-
-    res.json({ items });
+    return res.json({ items: data || [] });
   } catch (e) {
     console.error("GET /api/list error:", e);
-    res.status(500).json({ error: "list_failed" });
+    return res.status(500).json({ error: "list_failed" });
   }
 });
 
-// Create new item
-app.post("/api/items/new", async (req, res) => {
+// ---------- create new item ----------
+app.post("/api/items", async (req, res) => {
   try {
     const body = req.body || {};
-    const org = clean(body.org_slug) || DEFAULT_ORG;
-
     const ci = toNum(body.customer_impact);
     const te = toNum(body.team_energy);
     const fq = toNum(body.frequency);
     const ez = toNum(body.ease);
 
-    // Calculate priority rank if we have all 4 factors
-    let priority_rank = toNum(body.priority_rank);
-    let action_tier = clean(body.action_tier);
-    let leader_to_unblock = typeof body.leader_to_unblock === "boolean" ? body.leader_to_unblock : false;
+    let pr = 0;
+    let tier = "⚪ Park for later";
+    let ltb = false;
+    let stage = 1;
 
-    if (ci !== null && te !== null && fq !== null && ez !== null) {
-      priority_rank = computePriorityRank(ci, te, fq, ez);
-      
-      // Determine tier
-      if (priority_rank >= 60) {
-        action_tier = "Move now";
-      } else if (priority_rank >= 36) {
-        action_tier = "Move it forward";
-      } else {
-        action_tier = "When time allows";
-      }
-
-      // Leader to unblock: team_energy >= 9 AND ease <= 3
-      leader_to_unblock = (te >= 9 && ez <= 3);
+    // If all 4 factors provided, compute rank and set stage 2
+    if (ci && te && fq && ez) {
+      pr = computePriorityRank(ci, te, fq, ez);
+      tier = tierForPR(pr);
+      ltb = shouldLeaderUnblock(te, ez);
+      stage = 2; // Auto-advance to stage 2 (Clarify) when rated
     }
 
     const insertRow = {
-      org_slug: org,
-      user_id: clean(body.user_id) || clean(body.from) || null,
+      content: clean(body.content) || "Untitled",
+      user_id: clean(body.user_id) || null,
       originator_name: clean(body.originator_name) || null,
-      transcript: clean(body.transcript) || clean(body.body) || "",
-      title: clean(body.title) || null,
-      item_type: clean(body.item_type) || "frustration",
-      response: clean(body.response) || null,
+      priority_rank: pr,
+      action_tier: tier,
       customer_impact: ci,
       team_energy: te,
       frequency: fq,
       ease: ez,
-      priority_rank: priority_rank,
-      action_tier: action_tier,
-      leader_to_unblock: leader_to_unblock,
-      status: clean(body.status) || "open",
+      leader_to_unblock: ltb,
+      stage: stage,
+      stage_1_timestamp: new Date().toISOString(),
+      stage_2_timestamp: stage === 2 ? new Date().toISOString() : null,
     };
 
     const { data, error } = await supabase
       .from("items")
       .insert([insertRow])
-      .select("id")
+      .select("*")
       .single();
 
     if (error) throw error;
-
-    res.status(201).json({ ok: true, id: data.id });
+    return res.status(201).json(data);
   } catch (e) {
-    console.error("POST /api/items/new error:", e);
-    res.status(500).json({ error: "add_failed" });
+    console.error("POST /api/items error:", e);
+    return res.status(500).json({ error: "add_failed" });
   }
 });
 
-// Update item (title, etc)
-app.patch("/api/items/:id", async (req, res) => {
+// ---------- update factors ----------
+app.post("/items/:id/factors", async (req, res) => {
   try {
     const id = clean(req.params.id);
     if (!id) return res.status(400).json({ error: "bad_id" });
 
     const body = req.body || {};
-    const updates = {};
-
-    if (body.title) updates.title = clean(body.title);
-
-    if (Object.keys(updates).length === 0) {
-      return res.json({ ok: true, message: "no_changes" });
-    }
-
-    const { error } = await supabase
-      .from("items")
-      .update(updates)
-      .eq("id", id);
-
-    if (error) throw error;
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("PATCH /api/items/:id error:", e);
-    res.status(500).json({ error: "update_failed" });
-  }
-});
-
-// Update item factors (4 sliders)
-app.post("/api/items/:id/factors", async (req, res) => {
-  try {
-    const id = clean(req.params.id);
-    if (!id) return res.status(400).json({ error: "bad_id" });
-
-    const body = req.body || {};
-    const updates = {};
-
     const ci = toNum(body.customer_impact);
     const te = toNum(body.team_energy);
     const fq = toNum(body.frequency);
     const ez = toNum(body.ease);
 
-    if (ci !== null) updates.customer_impact = ci;
-    if (te !== null) updates.team_energy = te;
-    if (fq !== null) updates.frequency = fq;
-    if (ez !== null) updates.ease = ez;
-
-    // Recalculate priority_rank if we have all 4 factors
-    if (ci !== null && te !== null && fq !== null && ez !== null) {
-      updates.priority_rank = computePriorityRank(ci, te, fq, ez);
-      
-      // Determine tier
-      if (updates.priority_rank >= 60) {
-        updates.action_tier = "Move now";
-      } else if (updates.priority_rank >= 36) {
-        updates.action_tier = "Move it forward";
-      } else {
-        updates.action_tier = "When time allows";
-      }
-
-      // Leader to unblock: team_energy >= 9 AND ease <= 3
-      updates.leader_to_unblock = (te >= 9 && ez <= 3);
+    if (!ci || !te || !fq || !ez) {
+      return res.status(400).json({ error: "all_factors_required" });
     }
 
-    if (Object.keys(updates).length === 0) {
-      return res.json({ ok: true, message: "no_changes" });
+    const pr = computePriorityRank(ci, te, fq, ez);
+    const tier = tierForPR(pr);
+    const ltb = shouldLeaderUnblock(te, ez);
+
+    // Get current stage
+    const { data: current } = await supabase
+      .from("items")
+      .select("stage, stage_2_timestamp")
+      .eq("id", id)
+      .single();
+
+    const patch = {
+      customer_impact: ci,
+      team_energy: te,
+      frequency: fq,
+      ease: ez,
+      priority_rank: pr,
+      action_tier: tier,
+      leader_to_unblock: ltb,
+    };
+
+    // If this is first rating (stage 1 -> 2), advance stage
+    if (current && current.stage === 1 && !current.stage_2_timestamp) {
+      patch.stage = 2;
+      patch.stage_2_timestamp = new Date().toISOString();
     }
 
     const { error } = await supabase
       .from("items")
-      .update(updates)
+      .update(patch)
       .eq("id", id);
 
     if (error) throw error;
-
-    res.json({ ok: true, updates });
+    return res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: ltb });
   } catch (e) {
-    console.error("POST /api/items/:id/factors error:", e);
-    res.status(500).json({ error: "save_failed" });
+    console.error("POST /items/:id/factors error:", e);
+    return res.status(500).json({ error: "save_failed" });
   }
 });
 
-// Get item factors (for prefilling drawer)
-app.get("/api/items/:id/factors", async (req, res) => {
+// ---------- NEW: update lifecycle stage ----------
+app.post("/items/:id/stage", async (req, res) => {
   try {
     const id = clean(req.params.id);
-    
-    const { data, error } = await supabase
-      .from("items")
-      .select("customer_impact, team_energy, frequency, ease")
-      .eq("id", id)
-      .single();
+    if (!id) return res.status(400).json({ error: "bad_id" });
 
-    if (error || !data) {
-      return res.status(404).json({ error: "not_found" });
+    const { stage, note } = req.body;
+    const stageNum = parseInt(stage);
+
+    if (isNaN(stageNum) || stageNum < 1 || stageNum > 9) {
+      return res.status(400).json({ error: "invalid_stage" });
     }
 
-    res.json({
-      customer_impact: data.customer_impact ?? 0,
-      team_energy: data.team_energy ?? 0,
-      frequency: data.frequency ?? 0,
-      ease: data.ease ?? 0,
-    });
+    const patch = {
+      stage: stageNum,
+      [`stage_${stageNum}_timestamp`]: new Date().toISOString(),
+    };
+
+    // Stages 3-8 have text notes
+    if (stageNum >= 3 && stageNum <= 8 && note) {
+      const stageNames = {
+        3: "involve",
+        4: "choose",
+        5: "prepare",
+        6: "act",
+        7: "learn",
+        8: "recognise",
+      };
+      patch[`stage_${stageNum}_${stageNames[stageNum]}`] = clean(note);
+    }
+
+    // Stage 9 stores the generated story
+    if (stageNum === 9 && note) {
+      patch.stage_9_share = clean(note);
+    }
+
+    const { error } = await supabase
+      .from("items")
+      .update(patch)
+      .eq("id", id);
+
+    if (error) throw error;
+    return res.json({ ok: true, stage: stageNum });
   } catch (e) {
-    console.error("GET /api/items/:id/factors error:", e);
-    res.status(500).json({ error: "factors_failed" });
+    console.error("POST /items/:id/stage error:", e);
+    return res.status(500).json({ error: "stage_update_failed" });
   }
 });
 
-// Route aliases (UI sometimes calls without /api prefix)
-app.post("/items/new", (req, res) => {
-  req.url = "/api/items/new";
-  app._router.handle(req, res);
-});
-
-app.patch("/items/:id", (req, res) => {
-  req.url = `/api/items/${req.params.id}`;
-  app._router.handle(req, res);
-});
-
-app.post("/items/:id/factors", (req, res) => {
-  req.url = `/api/items/${req.params.id}/factors`;
-  app._router.handle(req, res);
-});
-
-app.get("/items/:id/factors", (req, res) => {
-  req.url = `/api/items/${req.params.id}/factors`;
-  app._router.handle(req, res);
-});
-
-// Start server
+// ---------- START ----------
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`✅ felma-backend running on port ${PORT}`);
+  console.log(`Felma backend running on ${PORT}`);
 });
