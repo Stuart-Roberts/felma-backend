@@ -62,16 +62,35 @@ app.get('/api/items', async (req, res) => {
   }
 });
 
-// CREATE ITEM - Set stage to 1 and save content to stage_1_capture
+// CREATE ITEM - Accept ratings during creation and advance to stage 3 if ratings provided
 app.post('/api/items', async (req, res) => {
   try {
     const content = req.body.content || req.body.transcript || '';
+    const { customer_impact, team_energy, frequency, ease } = req.body;
+    
+    // Check if ratings were provided
+    const hasRatings = customer_impact && team_energy && frequency && ease;
     
     const itemData = {
       ...req.body,
-      stage: 1,
+      stage: hasRatings ? 3 : 1,  // If ratings provided, skip to stage 3 (Involve)
       stage_1_capture: content
     };
+
+    // If ratings provided, calculate priority rank
+    if (hasRatings) {
+      const ci = Number(customer_impact) || 0;
+      const te = Number(team_energy) || 0;
+      const fr = Number(frequency) || 0;
+      const ea = Number(ease) || 0;
+      
+      const priority_rank = calculatePriorityRank(ci, te, fr, ea);
+      itemData.priority_rank = priority_rank;
+      itemData.customer_impact = ci;
+      itemData.team_energy = te;
+      itemData.frequency = fr;
+      itemData.ease = ea;
+    }
 
     const { data, error } = await supabase
       .from('items')
@@ -81,7 +100,7 @@ app.post('/api/items', async (req, res) => {
 
     if (error) throw error;
     
-    console.log('Item created:', { id: data.id, stage: data.stage });
+    console.log('Item created:', { id: data.id, stage: data.stage, hasRatings });
     res.status(201).json(data);
   } catch (error) {
     console.error('Error creating item:', error);
