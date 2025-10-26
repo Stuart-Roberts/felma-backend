@@ -102,7 +102,7 @@ app.post("/api/items", async (req, res) => {
   }
 });
 
-app.post("/items/:id/factors", async (req, res) => {
+app.post("/api/items/:id/factors", async (req, res) => {
   try {
     const id = clean(req.params.id);
     if (!id) return res.status(400).json({ error: "bad_id" });
@@ -141,7 +141,7 @@ app.post("/items/:id/factors", async (req, res) => {
   }
 });
 
-app.post("/items/:id/stage", async (req, res) => {
+app.post("/api/items/:id/stage", async (req, res) => {
   try {
     const id = clean(req.params.id);
     if (!id) return res.status(400).json({ error: "bad_id" });
