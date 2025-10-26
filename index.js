@@ -21,7 +21,25 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Get all items
+// Frontend legacy route - /list (without /api prefix)
+app.get('/list', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('items')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    
+    // Frontend expects { items: [...] } format
+    res.json({ items: data || [] });
+  } catch (error) {
+    console.error('Error fetching items:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all items - /api/items format
 app.get('/api/items', async (req, res) => {
   try {
     const { data, error } = await supabase
