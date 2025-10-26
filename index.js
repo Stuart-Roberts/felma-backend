@@ -1,6 +1,3 @@
-// index.js – Felma backend (COMPLETE FILE WITH LIFECYCLE)
-// Node 18+; requires SUPABASE_URL and SUPABASE_KEY env vars
-
 const express = require("express");
 const compression = require("compression");
 const { createClient } = require("@supabase/supabase-js");
@@ -11,7 +8,6 @@ app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// permissive CORS for pilot
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -22,7 +18,6 @@ app.use((req, res, next) => {
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ---------- helpers (rank, tier, leader flag) ----------
 function computePriorityRank(customer_impact, team_energy, frequency, ease) {
   const a = 0.57 * customer_impact + 0.43 * team_energy;
   const b = 0.6 * frequency + 0.4 * ease;
@@ -50,28 +45,12 @@ function clean(s) {
   return typeof s === "string" ? s.trim() : "";
 }
 
-// ---------- health ----------
 app.get("/", (_req, res) => res.send("Felma server is running."));
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ---------- list all items ----------
 app.get("/api/list", async (_req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("items")
-      .select(`
-        *,
-        stage,
-        stage_3_involve,
-        stage_4_choose,
-        stage_5_prepare,
-        stage_6_act,
-        stage_7_learn,
-        stage_8_recognise,
-        stage_9_share
-      `)
-      .order("created_at", { ascending: false });
-
+    const { data, error } = await supabase.from("items").select("*").order("created_at", { ascending: false });
     if (error) throw error;
     return res.json({ items: data || [] });
   } catch (e) {
@@ -80,7 +59,6 @@ app.get("/api/list", async (_req, res) => {
   }
 });
 
-// ---------- create new item ----------
 app.post("/api/items", async (req, res) => {
   try {
     const body = req.body || {};
@@ -89,17 +67,13 @@ app.post("/api/items", async (req, res) => {
     const fq = toNum(body.frequency);
     const ez = toNum(body.ease);
 
-    let pr = 0;
-    let tier = "⚪ Park for later";
-    let ltb = false;
-    let stage = 1;
+    let pr = 0, tier = "⚪ Park for later", ltb = false, stage = 1;
 
-    // If all 4 factors provided, compute rank and set stage 2
     if (ci && te && fq && ez) {
       pr = computePriorityRank(ci, te, fq, ez);
       tier = tierForPR(pr);
       ltb = shouldLeaderUnblock(te, ez);
-      stage = 2; // Auto-advance to stage 2 (Clarify) when rated
+      stage = 3; // ← JUMP TO STAGE 3 when rated
     }
 
     const insertRow = {
@@ -115,15 +89,11 @@ app.post("/api/items", async (req, res) => {
       leader_to_unblock: ltb,
       stage: stage,
       stage_1_timestamp: new Date().toISOString(),
-      stage_2_timestamp: stage === 2 ? new Date().toISOString() : null,
+      stage_2_timestamp: stage >= 2 ? new Date().toISOString() : null,
+      stage_3_timestamp: stage >= 3 ? new Date().toISOString() : null,
     };
 
-    const { data, error } = await supabase
-      .from("items")
-      .insert([insertRow])
-      .select("*")
-      .single();
-
+    const { data, error } = await supabase.from("items").insert([insertRow]).select("*").single();
     if (error) throw error;
     return res.status(201).json(data);
   } catch (e) {
@@ -132,7 +102,6 @@ app.post("/api/items", async (req, res) => {
   }
 });
 
-// ---------- update factors ----------
 app.post("/items/:id/factors", async (req, res) => {
   try {
     const id = clean(req.params.id);
@@ -144,20 +113,11 @@ app.post("/items/:id/factors", async (req, res) => {
     const fq = toNum(body.frequency);
     const ez = toNum(body.ease);
 
-    if (!ci || !te || !fq || !ez) {
-      return res.status(400).json({ error: "all_factors_required" });
-    }
+    if (!ci || !te || !fq || !ez) return res.status(400).json({ error: "all_factors_required" });
 
     const pr = computePriorityRank(ci, te, fq, ez);
     const tier = tierForPR(pr);
     const ltb = shouldLeaderUnblock(te, ez);
-
-    // Get current stage
-    const { data: current } = await supabase
-      .from("items")
-      .select("stage, stage_2_timestamp")
-      .eq("id", id)
-      .single();
 
     const patch = {
       customer_impact: ci,
@@ -167,19 +127,12 @@ app.post("/items/:id/factors", async (req, res) => {
       priority_rank: pr,
       action_tier: tier,
       leader_to_unblock: ltb,
+      stage: 3, // ← ADVANCE TO STAGE 3
+      stage_2_timestamp: new Date().toISOString(),
+      stage_3_timestamp: new Date().toISOString(),
     };
 
-    // If this is first rating (stage 1 -> 2), advance stage
-    if (current && current.stage === 1 && !current.stage_2_timestamp) {
-      patch.stage = 2;
-      patch.stage_2_timestamp = new Date().toISOString();
-    }
-
-    const { error } = await supabase
-      .from("items")
-      .update(patch)
-      .eq("id", id);
-
+    const { error } = await supabase.from("items").update(patch).eq("id", id);
     if (error) throw error;
     return res.json({ ok: true, priority_rank: pr, action_tier: tier, leader_to_unblock: ltb });
   } catch (e) {
@@ -188,7 +141,6 @@ app.post("/items/:id/factors", async (req, res) => {
   }
 });
 
-// ---------- NEW: update lifecycle stage ----------
 app.post("/items/:id/stage", async (req, res) => {
   try {
     const id = clean(req.params.id);
@@ -196,39 +148,21 @@ app.post("/items/:id/stage", async (req, res) => {
 
     const { stage, note } = req.body;
     const stageNum = parseInt(stage);
-
-    if (isNaN(stageNum) || stageNum < 1 || stageNum > 9) {
-      return res.status(400).json({ error: "invalid_stage" });
-    }
+    if (isNaN(stageNum) || stageNum < 1 || stageNum > 9) return res.status(400).json({ error: "invalid_stage" });
 
     const patch = {
       stage: stageNum,
       [`stage_${stageNum}_timestamp`]: new Date().toISOString(),
     };
 
-    // Stages 3-8 have text notes
     if (stageNum >= 3 && stageNum <= 8 && note) {
-      const stageNames = {
-        3: "involve",
-        4: "choose",
-        5: "prepare",
-        6: "act",
-        7: "learn",
-        8: "recognise",
-      };
+      const stageNames = { 3: "involve", 4: "choose", 5: "prepare", 6: "act", 7: "learn", 8: "recognise" };
       patch[`stage_${stageNum}_${stageNames[stageNum]}`] = clean(note);
     }
 
-    // Stage 9 stores the generated story
-    if (stageNum === 9 && note) {
-      patch.stage_9_share = clean(note);
-    }
+    if (stageNum === 9 && note) patch.stage_9_share = clean(note);
 
-    const { error } = await supabase
-      .from("items")
-      .update(patch)
-      .eq("id", id);
-
+    const { error } = await supabase.from("items").update(patch).eq("id", id);
     if (error) throw error;
     return res.json({ ok: true, stage: stageNum });
   } catch (e) {
@@ -237,8 +171,5 @@ app.post("/items/:id/stage", async (req, res) => {
   }
 });
 
-// ---------- START ----------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Felma backend running on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Felma backend running on ${PORT}`));
