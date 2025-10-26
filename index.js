@@ -58,9 +58,16 @@ app.get('/api/items', async (req, res) => {
 // CREATE ITEM - Frontend calls this as /api/items
 app.post('/api/items', async (req, res) => {
   try {
+    // When creating, set stage to 1 and save the initial content to stage_1_capture
+    const itemData = {
+      ...req.body,
+      stage: 1,
+      stage_1_capture: req.body.content || req.body.transcript || null
+    };
+
     const { data, error } = await supabase
       .from('items')
-      .insert([req.body])
+      .insert([itemData])
       .select()
       .single();
 
@@ -89,6 +96,46 @@ app.get('/api/items/:id', async (req, res) => {
   }
 });
 
+// Update ratings - When ratings are saved, complete Clarify stage and advance to stage 3
+app.post('/api/items/:id/ratings', async (req, res) => {
+  try {
+    const { customer_impact, team_energy, frequency, ease } = req.body;
+    
+    // Calculate priority rank
+    const ci = Number(customer_impact) || 0;
+    const te = Number(team_energy) || 0;
+    const fr = Number(frequency) || 0;
+    const ea = Number(ease) || 0;
+    
+    const a = 0.57 * ci + 0.43 * te;
+    const b = 0.6 * fr + 0.4 * ea;
+    const priority_rank = Math.round(a * b);
+
+    // Update data including advancing to stage 3 (Involve)
+    const updateData = {
+      customer_impact,
+      team_energy,
+      frequency,
+      ease,
+      priority_rank,
+      stage: 3  // Advance to stage 3 (Involve) after Clarify is complete
+    };
+
+    const { data, error } = await supabase
+      .from('items')
+      .update(updateData)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    console.error('Error updating ratings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Update stage and save note to CURRENT stage column
 app.post('/api/items/:id/stage', async (req, res) => {
   try {
@@ -98,12 +145,13 @@ app.post('/api/items/:id/stage', async (req, res) => {
     console.log("Stage update:", { id, stage, note });
 
     // Validate stage number
-    if (!stage || stage < 3 || stage > 9) {
+    if (!stage || stage < 1 || stage > 9) {
       return res.status(400).json({ error: "Invalid stage number" });
     }
 
-    // Map stage numbers to CURRENT stage column names
+    // Map stage numbers to their column names
     const fieldMap = {
+      1: "stage_1_capture",
       3: "stage_3_involve",
       4: "stage_4_choose",
       5: "stage_5_prepare",
@@ -119,9 +167,10 @@ app.post('/api/items/:id/stage', async (req, res) => {
       return res.status(400).json({ error: "Invalid stage for note saving" });
     }
 
-    // Build update object
+    // Build update object - save note and advance to next stage
+    const nextStage = stage < 9 ? stage + 1 : 9;
     const updateData = {
-      stage: stage,
+      stage: nextStage,
       [fieldToUpdate]: note
     };
 
@@ -140,24 +189,6 @@ app.post('/api/items/:id/stage', async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error("Stage update error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update ratings
-app.post('/api/items/:id/ratings', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('items')
-      .update(req.body)
-      .eq('id', req.params.id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    console.error('Error updating ratings:', error);
     res.status(500).json({ error: error.message });
   }
 });
