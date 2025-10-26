@@ -21,8 +21,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Frontend legacy route - /list (without /api prefix)
-app.get('/list', async (req, res) => {
+// LIST ITEMS - Frontend calls this as /api/list
+app.get('/api/list', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('items')
@@ -34,12 +34,12 @@ app.get('/list', async (req, res) => {
     // Frontend expects { items: [...] } format
     res.json({ items: data || [] });
   } catch (error) {
-    console.error('Error fetching items:', error);
+    console.error('Error fetching list:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Get all items - /api/items format
+// Get all items - alternative endpoint
 app.get('/api/items', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -51,6 +51,23 @@ app.get('/api/items', async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error('Error fetching items:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// CREATE ITEM - Frontend calls this as /api/items
+app.post('/api/items', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('items')
+      .insert([req.body])
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    console.error('Error creating item:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -68,23 +85,6 @@ app.get('/api/items/:id', async (req, res) => {
     res.json(data);
   } catch (error) {
     console.error('Error fetching item:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Create new item
-app.post('/api/items', async (req, res) => {
-  try {
-    const { data, error } = await supabase
-      .from('items')
-      .insert([req.body])
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.status(201).json(data);
-  } catch (error) {
-    console.error('Error creating item:', error);
     res.status(500).json({ error: error.message });
   }
 });
