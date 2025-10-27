@@ -19,12 +19,13 @@ const supabase = createClient(
 // OpenAI API key from environment
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Headline generation rules (v1.3)
+// Headline generation rules (v2.0 - Universal Framework)
 const HEADLINE_RULES = `# Frustrations → Ideas Headline Standard  
-**Version:** v1.3 (Concise Two-Word Rule)  
+**Version:** v2.0 (Universal Multi-Domain Framework)
 
 ## Your Task
-Convert raw user input into a standardized headline following this exact format:
+Convert raw user input into a standardized headline following this exact format.
+This system works across ALL workplaces: manufacturing, education, healthcare, retail, government, services.
 
 ## Structure
 \`[Cause / Concern] – [Effect (Verb or Adjective)] [Parameter]\`
@@ -34,38 +35,134 @@ Convert raw user input into a standardized headline following this exact format:
 2. **Max 5-6 words total** (≈ 3 + 2 structure)
 3. Use en-dash with spaces: " – "
 4. **Title Case** main words; no punctuation at end
-5. Keep tone factual and objective (no "Kills", "Destroys" - use "Lowers", "Reduces")
-6. If uncertain about effect or parameter, use: "– (to review)"
+5. Keep tone factual and objective (no "Kills", "Destroys")
+6. **Preserve specific context words** - Don't drop important qualifiers (e.g., "Material Deliveries" not just "Deliveries")
+7. If uncertain about effect or parameter, use: "– (to review)"
 
-## Parameter Library (Choose ONE)
-- **Safety** - Physical/procedural safety, ergonomics, PPE
-- **Quality** - Product/process correctness, consistency
-- **Compliance** - Legal/procedural adherence, audit
-- **Delivery** - Timing, throughput, flow
-- **Value** - Cost, waste, efficiency, profitability
-- **Morale** - Team energy, fairness, motivation
-- **Experience** - Customer/user perception, reputation
+## CRITICAL: Detect Improvement Ideas
+If input contains "Add", "Introduce", "Implement", "Create", "Build" - this is a SOLUTION, not a problem!
+- ❌ WRONG: "Tool Board Missing"
+- ✅ RIGHT: "Tool Board Proposed – Boosts Efficiency"
 
-## Effect Words
-**Verbs** (for improvements): Improve, Reduce, Raise, Lower, Boost, Enhance, Speed, Streamline
-**Adjectives** (for problems): Risk, Issue, Variation, Delay, Barrier, Hazard, Defect
+## Universal Parameter Library (Choose ONE)
 
-## Examples
-| Input | Headline |
-|-------|----------|
-| Replace conical flasks (non-slip, better markings) | Conical Flasks Slippery – Quality Risk |
-| Get gloves for smaller hand sizes | Small Gloves Lacking – Safety Risk |
-| Clocking policy unfair | Clocking Policy Unfair – Lowers Morale |
-| Fix noisy chair casters | Chair Casters Noisy – Disrupts Focus |
-| Add team break area | No Team Break Area – Raise Morale |
-| Mixing blades inconsistent | Mixing Blades Inconsistent – Quality Variation |
-| Build FIFO rack feed | FIFO Rack Missing – Flow Inefficient |
-| CAPA reports go overdue | CAPA Reports Overdue – Compliance Risk |
+### 1. Safety & Wellbeing
+Physical safety + mental wellbeing for workers, learners, patients, customers, public.
+Includes: Hazards, injuries, ergonomics, PPE, stress, burnout, workload pressure, safeguarding systems.
+Use when: Physical harm risk OR mental wellbeing at risk.
 
-## Important
+### 2. Quality  
+Correctness, consistency, standards, effectiveness of outputs/outcomes.
+Manufacturing: Product consistency, defect rates, batch variation.
+Education: Teaching effectiveness, learning outcomes, assessment accuracy.
+Healthcare: Care standards, treatment outcomes, clinical protocols.
+Services: Work accuracy, deliverable standards, error rates.
+Use when: Standards, correctness, outcomes affected.
+
+### 3. Compliance
+Legal obligations, regulatory requirements, audit readiness, policy adherence.
+Manufacturing: ISO, FDA, CAPA, traceability.
+Education: Ofsted, safeguarding policies, DfE guidelines.
+Healthcare: CQC, clinical governance, GDPR.
+Government: Statutory obligations, FOI, transparency.
+Use when: Legal/regulatory risk or audit gaps.
+
+### 4. Timely Delivery
+Timing, speed, throughput, availability, schedule adherence.
+Can use proxies: "Delays Production", "Delays Work", "Slows Process".
+Manufacturing: Production throughput, dispatch timing, schedule adherence.
+Education: Curriculum pace, assessment deadlines.
+Healthcare: Appointment availability, waiting times.
+Services: Project deadlines, turnaround times, SLA compliance.
+Use when: Timing, speed, or availability issues.
+
+### 5. Value
+Cost, waste, efficiency, resource optimization, financial sustainability.
+Manufacturing: Waste reduction, cost control, margins.
+Education: Budget efficiency, resource waste.
+Healthcare: Treatment costs, resource waste.
+Services: Operational costs, time waste.
+Government: Taxpayer value, budget efficiency.
+Use when: Money, resources, waste, or cost affected.
+
+### 6. Morale
+Team motivation, energy, fairness, recognition, working culture.
+Includes: Motivation, fairness, recognition, team engagement, workplace culture.
+Note: Mental wellbeing can go here OR in Safety & Wellbeing - both valid.
+Use when: Motivation, fairness, recognition, or team culture affected.
+
+### 7. Customer Experience
+External stakeholder perception, trust, reputation, satisfaction.
+WHO are customers?: End users, patients, students, parents, citizens, clients - anyone OUTSIDE the organization.
+Manufacturing: End users, distributors, brand perception.
+Education: Students, parents, community, inspectors.
+Healthcare: Patients, families, commissioners.
+Government: Citizens, service users, public trust.
+Use when: External perception, reputation, or stakeholder trust affected.
+KEY: Use this for PERCEPTION issues, not internal quality standards.
+
+## Parameter Priority
+1. Safety & Wellbeing - if physical/mental harm risk (systemic, not active incidents)
+2. Compliance - if legal/regulatory risk (process gaps, not active breaches)
+3. Customer Experience - if external perception/reputation affected
+4. Quality vs Timely Delivery - Quality = WHAT (correctness), Timely Delivery = WHEN (speed)
+5. Value - cost/waste/resource efficiency
+6. Morale - motivation/fairness (when not wellbeing issue)
+
+## Effect Words (Use These)
+**For improvements:** Raises, Boosts, Enhances, Reduces, Lowers, Speeds, Improves
+**For problems:** Risk, Issue, Variation, Hazard, Defect
+**For impacts:** Damages (Reputation/Experience), Delays (Production/Work), Wastes (Time/Resources)
+
+**Preferred combinations:**
+- "Raises Quality" (not "Improves Quality")
+- "Lowers Morale"
+- "Damages Reputation" or "Damages Experience"
+- "Delays Production" or "Delays Work"
+
+## Multi-Domain Examples
+
+### Manufacturing:
+- "Replace conical flasks they're slippery and hard to read" → "Conical Flasks Slippery – Quality Risk"
+- "Raw material deliveries arrive late" → "Late Material Deliveries – Delays Production"
+- "No recognition for overtime work" → "Overtime Recognition Missing – Lowers Morale"
+- "Workload during peak causing stress" → "Peak Season Workload – Wellbeing Risk"
+
+### Education:
+- "Run classroom observations to share effective practice" → "Classroom Observations Proposed – Raises Quality"
+- "Parents complain about inconsistent homework marking" → "Inconsistent Homework Marking – Damages Reputation"
+- "Break room tables too small" → "Break Room Tables Small – Lowers Morale"
+- "Teacher workload unsustainable causing burnout" → "Teacher Workload Unsustainable – Wellbeing Risk"
+
+### Healthcare:
+- "Patient records scattered across 3 systems" → "Patient Records Scattered – Compliance Risk"
+- "Waiting room chairs uncomfortable for elderly" → "Waiting Room Chairs Uncomfortable – Damages Experience"
+
+### Retail/Services:
+- "Customers receive incorrect invoices 10% of time" → "Incorrect Invoices – Damages Reputation"
+- "Energy bills increased 40% from machines left on" → "Energy Bills Increased – Value Issue"
+
+### Government:
+- "FOI requests going overdue regularly" → "FOI Requests Overdue – Compliance Risk"
+- "Citizens complain about confusing online forms" → "Online Forms Confusing – Damages Experience"
+
+## CRITICAL GUARDRAILS
+🚨 If input contains ACTIVE INCIDENTS (not systemic risks), output: "(Escalate - Not for Felma)"
+
+Red flags: Named person + harm words ("John bleeding", "Peter injured"), active breaches ("we shipped without testing"), emergency language ("happening now", "urgent danger").
+
+Examples:
+- ❌ "John's finger caught in machine, bleeding" → "(Escalate - Not for Felma)"
+- ✅ "Machine guard keeps failing, could trap fingers" → "Machine Guard Failing – Safety Risk"
+- ❌ "We shipped product without required testing" → "(Escalate - Not for Felma)"  
+- ✅ "Testing documentation often incomplete" → "Testing Documentation Incomplete – Compliance Risk"
+
+## Output Instructions
 - Output ONLY the headline, nothing else
-- If multiple parameters apply or effect unclear: use "– (to review)"
 - Never exceed 2 words after the hyphen
+- If uncertain: use "– (to review)"
+- Preserve specific context words (don't over-shorten)
+- Detect improvement ideas correctly (don't say "Missing" when they're proposing to add it)
 `;
 
 // Generate headline using GPT-3.5 Turbo
