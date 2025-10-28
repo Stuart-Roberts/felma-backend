@@ -250,7 +250,10 @@ async function generateHeadline(content) {
     }
 
     const data = await response.json();
-    const headline = data.choices[0].message.content.trim();
+    let headline = data.choices[0].message.content.trim();
+    
+    // Remove any wrapping quotes (single or double)
+    headline = headline.replace(/^["']|["']$/g, '');
     
     // Validate it looks like a headline
     if (headline.includes(' – ') || headline.includes(' - ')) {
