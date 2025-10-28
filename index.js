@@ -19,9 +19,9 @@ const supabase = createClient(
 // OpenAI API key from environment
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Headline generation rules (v2.1 - Cost Efficiency Update)
+// Headline generation rules (v2.2 - Cost Efficiency with Specific Verbs)
 const HEADLINE_RULES = `# Frustrations → Ideas Headline Standard  
-**Version:** v2.1 (Universal Multi-Domain Framework - Cost Efficiency)
+**Version:** v2.2 (Cost Efficiency with Specific Effect Verbs)
 
 ## Your Task
 Convert raw user input into a standardized headline following this exact format.
@@ -134,11 +134,31 @@ KEY: Use this for PERCEPTION issues, not internal quality standards.
 **For problems:** Risk, Issue, Variation, Hazard, Defect
 **For impacts:** Damages (Reputation/Experience), Delays (Production/Work), Wastes (Time/Resources)
 
+**For Cost Efficiency - PREFER SPECIFIC VERBS (most important):**
+- "Increases Costs" - when bills/spending go up
+- "Wastes Money" - when direct financial waste
+- "Wastes Resources" - when materials/supplies wasted
+- "Wastes Time" - when time/labor wasted
+- "Reduces Efficiency" - when process inefficiency costs money
+
+Examples:
+- "Energy bills increased 40%" → "Energy Bills Increased – Increases Costs"
+- "Overtime doubled due to planning" → "Overtime Costs Doubled – Wastes Money"
+- "Throw away 15% ingredients" → "Ingredient Waste – Wastes Resources"
+- "Walk 200m to get supplies daily, wastes 15 min" → "Supply Distance Long – Wastes Time"
+
+If specific verb unclear, use:
+- "Cost Efficiency Problem" or "Cost Efficiency Risk"
+
+Only if completely uncertain:
+- "Cost Efficiency" (parameter alone)
+
 **Preferred combinations:**
 - "Raises Quality" (not "Improves Quality")
 - "Lowers Morale"
 - "Damages Reputation" or "Damages Experience"
 - "Delays Production" or "Delays Work"
+- "Increases Costs" or "Wastes Money/Time/Resources" (for Cost Efficiency)
 
 ## Multi-Domain Examples
 
@@ -160,7 +180,7 @@ KEY: Use this for PERCEPTION issues, not internal quality standards.
 
 ### Retail/Services:
 - "Customers receive incorrect invoices 10% of time" → "Incorrect Invoices – Damages Reputation"
-- "Energy bills increased 40% from machines left on" → "Energy Bills Increased – Cost Efficiency Issue"
+- "Energy bills increased 40% from machines left on" → "Energy Bills Increased – Increases Costs"
 
 ### Government:
 - "FOI requests going overdue regularly" → "FOI Requests Overdue – Compliance Risk"
@@ -179,6 +199,7 @@ Examples:
 
 ## Output Instructions
 - Output ONLY the headline, nothing else
+- Never wrap the headline in quotation marks - output directly without quotes
 - Never exceed 2 words after the hyphen
 - If uncertain: use "– (to review)"
 - Preserve specific context words (don't over-shorten)
