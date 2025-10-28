@@ -19,9 +19,9 @@ const supabase = createClient(
 // OpenAI API key from environment
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Headline generation rules (v2.0 - Universal Framework)
+// Headline generation rules (v2.1 - Cost Efficiency Update)
 const HEADLINE_RULES = `# Frustrations → Ideas Headline Standard  
-**Version:** v2.0 (Universal Multi-Domain Framework)
+**Version:** v2.1 (Universal Multi-Domain Framework - Cost Efficiency)
 
 ## Your Task
 Convert raw user input into a standardized headline following this exact format.
@@ -76,14 +76,34 @@ Healthcare: Appointment availability, waiting times.
 Services: Project deadlines, turnaround times, SLA compliance.
 Use when: Timing, speed, or availability issues.
 
-### 5. Value
-Cost, waste, efficiency, resource optimization, financial sustainability.
-Manufacturing: Waste reduction, cost control, margins.
-Education: Budget efficiency, resource waste.
-Healthcare: Treatment costs, resource waste.
-Services: Operational costs, time waste.
-Government: Taxpayer value, budget efficiency.
-Use when: Money, resources, waste, or cost affected.
+### 5. Cost Efficiency
+Utilization of money, materials, and resources - both reducing waste AND optimizing use.
+Direct, visible financial impact: spending, bills, materials, supplies, resource consumption.
+
+What counts as Cost Efficiency:
+- Bills and invoices (energy, utilities, services) - "Energy bills increased 40%" → Cost Efficiency
+- Direct spending (overtime due to planning failures, budget overruns) - "Overtime costs doubled" → Cost Efficiency
+- Material waste (thrown away, expired, scrapped) - "Throw away 15% ingredients" → Cost Efficiency
+- Supply waste (overordering, stock loss)
+- Resource misuse with direct £/$ impact (time waste, walking, motion)
+- Process inefficiencies that directly waste money/materials
+
+What is NOT Cost Efficiency (even though it has cost implications):
+- Rework due to defects → Quality (root cause)
+- Delays causing penalties → Timely Delivery (root cause)
+- Safety incidents → Safety & Wellbeing (root cause)
+- Staff turnover → Morale (root cause)
+
+KEY RULE: If you can immediately put a £/$ figure on waste, it's Cost Efficiency.
+If cost is a CONSEQUENCE of another problem, use the root cause parameter.
+
+Manufacturing: Material waste, energy bills, supply costs, scrap reduction.
+Education: Budget waste, utility bills, resource overuse.
+Healthcare: Supply waste, energy costs, unnecessary spending.
+Services: Operational waste, utility costs, material costs.
+Government: Taxpayer money waste, budget inefficiency.
+
+Use when: Direct financial or resource waste/inefficiency that you can immediately quantify in £/$.
 
 ### 6. Morale
 Team motivation, energy, fairness, recognition, working culture.
@@ -106,7 +126,7 @@ KEY: Use this for PERCEPTION issues, not internal quality standards.
 2. Compliance - if legal/regulatory risk (process gaps, not active breaches)
 3. Customer Experience - if external perception/reputation affected
 4. Quality vs Timely Delivery - Quality = WHAT (correctness), Timely Delivery = WHEN (speed)
-5. Value - cost/waste/resource efficiency
+5. Cost Efficiency - direct financial/resource waste (can put £/$ on it immediately)
 6. Morale - motivation/fairness (when not wellbeing issue)
 
 ## Effect Words (Use These)
@@ -140,7 +160,7 @@ KEY: Use this for PERCEPTION issues, not internal quality standards.
 
 ### Retail/Services:
 - "Customers receive incorrect invoices 10% of time" → "Incorrect Invoices – Damages Reputation"
-- "Energy bills increased 40% from machines left on" → "Energy Bills Increased – Value Issue"
+- "Energy bills increased 40% from machines left on" → "Energy Bills Increased – Cost Efficiency Issue"
 
 ### Government:
 - "FOI requests going overdue regularly" → "FOI Requests Overdue – Compliance Risk"
