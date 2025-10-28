@@ -339,7 +339,7 @@ app.post('/api/items', async (req, res) => {
       stage_1_capture: content
     };
 
-    // If ratings provided, calculate priority rank
+    // If ratings provided, calculate priority rank and leader_to_assist flag
     if (hasRatings) {
       const ci = Number(customer_impact) || 0;
       const te = Number(team_energy) || 0;
@@ -347,11 +347,14 @@ app.post('/api/items', async (req, res) => {
       const ea = Number(ease) || 0;
       
       const priority_rank = calculatePriorityRank(ci, te, fr, ea);
+      const leader_to_assist = (te >= 9) && (ea <= 3);
+      
       itemData.priority_rank = priority_rank;
       itemData.customer_impact = ci;
       itemData.team_energy = te;
       itemData.frequency = fr;
       itemData.ease = ea;
+      itemData.leader_to_assist = leader_to_assist;
     }
 
     const { data, error } = await supabase
@@ -451,6 +454,7 @@ app.post('/api/items/:id/ratings', async (req, res) => {
     const ea = Number(ease) || 0;
     
     const priority_rank = calculatePriorityRank(ci, te, fr, ea);
+    const leader_to_assist = (te >= 9) && (ea <= 3);
 
     // After ratings saved, advance to stage 3 (Involve)
     const updateData = {
@@ -459,6 +463,7 @@ app.post('/api/items/:id/ratings', async (req, res) => {
       frequency: fr,
       ease: ea,
       priority_rank,
+      leader_to_assist,
       stage: 3  // Clarify (stage 2) is now complete, advance to Involve
     };
 
